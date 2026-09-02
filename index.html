@@ -1,46 +1,15 @@
 <!doctype html>
 <html lang="pt-BR">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-  <title>Limpo — Laboratório de PIN</title>
-  <style>
-    *{box-sizing:border-box}body{margin:0;min-height:100vh;background:#080b10;color:#d7ffe1;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;padding:24px}.wrap{width:min(760px,100%);margin:auto}.title{font-size:20px;margin-bottom:6px}.sub{color:#81908a;font-size:13px;margin-bottom:22px}.panel{border:1px solid #26342c;background:#0d1217;border-radius:14px;padding:16px}.row{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}label{display:block;color:#91a49a;font-size:12px;margin-bottom:6px}input{width:100%;background:#080b10;border:1px solid #2c3c33;color:#eaffef;border-radius:9px;padding:12px;font:inherit;font-size:16px}button{border:0;border-radius:9px;padding:12px 16px;font:inherit;font-weight:700;cursor:pointer}#start{background:#57e389;color:#07110a}#stop{background:#242c28;color:#d8e4dc}.buttons{display:flex;gap:10px;margin-bottom:16px}.status{display:flex;justify-content:space-between;gap:10px;border-top:1px solid #202a25;padding-top:14px;font-size:13px}.value{color:#57e389}.terminal{margin-top:14px;height:320px;overflow:auto;background:#050709;border:1px solid #1d2721;border-radius:10px;padding:12px;font-size:13px;line-height:1.55}.ok{color:#57e389}.bad{color:#9ca9a2}.found{color:#fff;font-weight:800;background:#174d2b;padding:2px 5px;border-radius:4px}@media(max-width:560px){body{padding:14px}.row{grid-template-columns:1fr}.terminal{height:360px}}
-  </style>
-</head>
-<body>
-<div class="wrap">
-  <div class="title">$ LIMPO / laboratório de PIN</div>
-  <div class="sub">Simulação local. Nenhuma requisição é enviada para outros sites.</div>
-  <div class="panel">
-    <div class="row">
-      <div><label>PIN secreto (6 dígitos)</label><input id="target" inputmode="numeric" maxlength="6" value="025990"></div>
-      <div><label>Começar em</label><input id="initial" inputmode="numeric" maxlength="6" value="025980"></div>
-    </div>
-    <div class="buttons"><button id="start">▶ INICIAR</button><button id="stop">■ PARAR</button></div>
-    <div class="status"><span>Tentativa: <b id="current" class="value">------</b></span><span>Total: <b id="count">0</b></span></div>
-    <div id="terminal" class="terminal"><div class="ok">Sistema pronto.</div></div>
-  </div>
-</div>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>Limpo — Laboratório de PIN</title>
+<style>*{box-sizing:border-box}body{margin:0;min-height:100vh;background:#080b10;color:#d7ffe1;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;padding:24px}.wrap{width:min(760px,100%);margin:auto}.title{font-size:20px;margin-bottom:6px}.sub{color:#81908a;font-size:13px;margin-bottom:22px}.panel{border:1px solid #26342c;background:#0d1217;border-radius:14px;padding:16px}.row{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}label{display:block;color:#91a49a;font-size:12px;margin-bottom:6px}input{width:100%;background:#080b10;border:1px solid #2c3c33;color:#eaffef;border-radius:9px;padding:12px;font:inherit;font-size:16px}button{border:0;border-radius:9px;padding:12px 16px;font:inherit;font-weight:700;cursor:pointer}#start{background:#57e389;color:#07110a}#stop{background:#242c28;color:#d8e4dc}.buttons{display:flex;gap:10px;margin-bottom:16px}.status{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;border-top:1px solid #202a25;padding-top:14px;font-size:13px}.value{color:#57e389}.terminal{margin-top:14px;height:260px;overflow:auto;background:#050709;border:1px solid #1d2721;border-radius:10px;padding:12px;font-size:13px;line-height:1.55}.ok{color:#57e389}.found{color:#fff;font-weight:800;background:#174d2b;padding:3px 6px;border-radius:4px}@media(max-width:560px){body{padding:14px}.row,.status{grid-template-columns:1fr}.terminal{height:300px}}</style>
+</head><body><div class="wrap"><div class="title">$ LIMPO / laboratório de PIN</div><div class="sub">Benchmark local no navegador — sem requisições para outros sites.</div><div class="panel"><div class="row"><div><label>PIN secreto (6 dígitos)</label><input id="target" inputmode="numeric" maxlength="6" value="900000"></div><div><label>Começar em</label><input id="initial" inputmode="numeric" maxlength="6" value="000000"></div></div><div class="buttons"><button id="start">▶ VELOCIDADE MÁXIMA</button><button id="stop">■ PARAR</button></div><div class="status"><span>Atual: <b id="current" class="value">------</b></span><span>Tentativas: <b id="count">0</b></span><span>Velocidade: <b id="speed" class="value">0/s</b></span></div><div id="terminal" class="terminal"><div class="ok">Sistema pronto.</div></div></div></div>
 <script>
-const $=s=>document.querySelector(s);
-let timer=null,count=0,current=0;
-function line(text,cls='bad'){
-  const d=document.createElement('div');d.className=cls;d.textContent=text;$('#terminal').appendChild(d);$('#terminal').scrollTop=$('#terminal').scrollHeight;
-}
-function stop(){if(timer){clearInterval(timer);timer=null;line('Processo interrompido.','ok')}}
-$('#stop').onclick=stop;
-$('#start').onclick=()=>{
-  if(timer)return;
-  const target=$('#target').value.replace(/\D/g,'').padStart(6,'0').slice(-6);
-  current=parseInt($('#initial').value.replace(/\D/g,'')||'0',10);count=0;$('#count').textContent='0';$('#terminal').innerHTML='';line('Iniciando enumeração local...','ok');
-  timer=setInterval(()=>{
-    const value=String(current).padStart(6,'0');count++;$('#current').textContent=value;$('#count').textContent=count;line('Tentando: '+value);
-    if(value===target){clearInterval(timer);timer=null;line('✓ PIN encontrado: '+value,'found');return;}
-    current++;
-    if(current>999999){clearInterval(timer);timer=null;line('Fim do espaço de busca.','ok');}
-  },120);
-};
-</script>
-</body>
-</html>
+const $=s=>document.querySelector(s);let running=false,current=0,count=0,startTime=0,target=0;const BATCH=25000;
+function line(t,c=''){const d=document.createElement('div');d.className=c;d.textContent=t;$('#terminal').appendChild(d);$('#terminal').scrollTop=$('#terminal').scrollHeight}
+function refresh(){const elapsed=Math.max((performance.now()-startTime)/1000,.001);$('#current').textContent=String(Math.min(current,999999)).padStart(6,'0');$('#count').textContent=count.toLocaleString('pt-BR');$('#speed').textContent=Math.round(count/elapsed).toLocaleString('pt-BR')+'/s'}
+function finish(found){running=false;refresh();line(found?'✓ PIN encontrado: '+String(target).padStart(6,'0'):'Fim do espaço de busca.',found?'found':'ok')}
+function runBatch(){if(!running)return;const end=Math.min(current+BATCH,1000000);for(;current<end;current++){count++;if(current===target){current++;finish(true);return}}refresh();if(current>=1000000){finish(false);return}setTimeout(runBatch,0)}
+$('#stop').onclick=()=>{if(running){running=false;refresh();line('Processo interrompido.','ok')}};
+$('#start').onclick=()=>{if(running)return;target=parseInt($('#target').value.replace(/\D/g,'')||'0',10);current=parseInt($('#initial').value.replace(/\D/g,'')||'0',10);target=Math.min(Math.max(target,0),999999);current=Math.min(Math.max(current,0),999999);count=0;startTime=performance.now();running=true;$('#terminal').innerHTML='';line('Processando em lotes de '+BATCH.toLocaleString('pt-BR')+' comparações...','ok');runBatch()};
+</script></body></html>
