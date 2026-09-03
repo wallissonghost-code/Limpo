@@ -104,6 +104,13 @@ async function discoverFirebase(target) {
   return config;
 }
 
+function classifyFirebaseError(code) {
+  const value = String(code || 'AUTH_FAILED').toUpperCase();
+  if (/TOO_MANY|QUOTA|RATE|TRY_LATER/.test(value)) return 'blocked';
+  if (/INVALID_LOGIN_CREDENTIALS|INVALID_PASSWORD|EMAIL_NOT_FOUND/.test(value)) return 'invalid';
+  return 'indeterminate';
+}
+
 async function handleUrlAuthTest(request) {
   let body = {};
   try { body = await request.json(); } catch {}
@@ -113,12 +120,12 @@ async function handleUrlAuthTest(request) {
   const password = String(body?.password || '');
   const authorized = body?.authorized === true;
 
-  if (!authorized) return json({ ok: false, error: 'authorization_required' }, 400);
+  if (!authorized) return json({ ok: false, error: 'authorization_required', classification: 'indeterminate' }, 400);
   if (!target || !isAuthorizedLabHost(target.hostname)) {
-    return json({ ok: false, error: 'target_not_allowed', message: 'Este modo aceita apenas os domínios autorizados do laboratório.' }, 403);
+    return json({ ok: false, error: 'target_not_allowed', classification: 'indeterminate', message: 'Este modo aceita apenas os domínios autorizados do laboratório.' }, 403);
   }
   if (!email || !password || email.length > 254 || password.length > 256) {
-    return json({ ok: false, error: 'invalid_input' }, 400);
+    return json({ ok: false, error: 'invalid_input', classification: 'indeterminate' }, 400);
   }
 
   const started = Date.now();
@@ -126,46 +133,59 @@ async function handleUrlAuthTest(request) {
   try {
     config = await discoverFirebase(target);
   } catch (error) {
-    return json({ ok: false, error: 'target_unreachable', detail: String(error?.message || 'fetch_failed') }, 502);
+    return json({ ok: false, error: 'target_unreachable', classification: 'indeterminate', detail: String(error?.message || 'fetch_failed') }, 502);
   }
 
   if (!config?.apiKey) {
-    return json({ ok: false, error: 'firebase_not_detected', authType: 'unknown', latencyMs: Date.now() - started }, 422);
+    return json({ ok: false, error: 'firebase_not_detected', classification: 'indeterminate', authType: 'unknown', latencyMs: Date.now() - started }, 422);
   }
 
   const endpoint = `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${encodeURIComponent(config.apiKey)}`;
-  const authResponse = await fetch(endpoint, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ email, password, returnSecureToken: true })
-  });
-  const data = await authResponse.json().catch(() => ({}));
+  let authResponse;
+  let data;
+  try {
+    authResponse = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password, returnSecureToken: true })
+    });
+    data = await authResponse.json().catch(() => ({}));
+  } catch (error) {
+    return json({ ok: false, authenticated: false, classification: 'indeterminate', authType: 'firebase-password', error: 'provider_unreachable', latencyMs: Date.now() - started }, 502);
+  }
+
   const latencyMs = Date.now() - started;
 
   if (authResponse.ok && data?.localId) {
     return json({
       ok: true,
       authenticated: true,
+      classification: 'authenticated',
       authType: 'firebase-password',
       projectId: config.projectId || null,
       authDomain: config.authDomain || null,
       email: data.email || email,
+      providerHttpStatus: authResponse.status,
       latencyMs
     });
   }
 
   const firebaseCode = String(data?.error?.message || 'AUTH_FAILED');
-  const rateLimited = /TOO_MANY|QUOTA|RATE/i.test(firebaseCode);
+  const classification = classifyFirebaseError(firebaseCode);
+  const status = classification === 'blocked' ? 429 : classification === 'invalid' ? 401 : 422;
+
   return json({
     ok: false,
     authenticated: false,
+    classification,
     authType: 'firebase-password',
     projectId: config.projectId || null,
     authDomain: config.authDomain || null,
-    error: rateLimited ? 'rate_limited' : 'invalid_credentials',
+    error: classification === 'blocked' ? 'rate_limited' : classification === 'invalid' ? 'invalid_credentials' : 'indeterminate_auth_result',
     providerCode: firebaseCode,
+    providerHttpStatus: authResponse.status,
     latencyMs
-  }, rateLimited ? 429 : 401);
+  }, status);
 }
 
 export class LoginLimiter {
