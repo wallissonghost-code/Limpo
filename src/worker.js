@@ -82,7 +82,7 @@ function extractModuleUrls(text, baseUrl) {
 async function readTextLimited(url) {
   const response = await fetch(url, {
     redirect: 'follow',
-    headers: { 'User-Agent': 'LIMPO-Authorized-Auth-Audit/2.0' }
+    headers: { 'User-Agent': 'LIMPO-Authorized-Auth-Audit/2.1' }
   });
   if (!response.ok) throw new Error(`target_http_${response.status}`);
   const finalUrl = new URL(response.url || url.href || String(url));
@@ -92,7 +92,52 @@ async function readTextLimited(url) {
   return { text: (await response.text()).slice(0, 1_500_000), finalUrl };
 }
 
-function providerSignals(text) {
+function extractCustomAuthHints(text, baseUrl) {
+  const s = String(text || '');
+  const hints = [];
+  const endpoints = new Set();
+  const fields = new Set();
+
+  const endpointPatterns = [
+    /fetch\s*\(\s*["'`]([^"'`]*(?:login|signin|sign-in|auth|session|token)[^"'`]*)["'`]/gi,
+    /axios\.(?:post|put)\s*\(\s*["'`]([^"'`]*(?:login|signin|sign-in|auth|session|token)[^"'`]*)["'`]/gi,
+    /(?:url|endpoint|baseURL)\s*[:=]\s*["'`]([^"'`]*(?:login|signin|sign-in|auth|session|token)[^"'`]*)["'`]/gi,
+    /["'`]((?:\/|https:\/\/)[^"'`]{0,140}\/(?:api\/)?(?:auth\/)?(?:login|signin|sign-in|session|token)[^"'`]*)["'`]/gi
+  ];
+
+  for (const pattern of endpointPatterns) {
+    let m;
+    while ((m = pattern.exec(s)) && endpoints.size < 12) {
+      try {
+        const u = new URL(m[1], baseUrl);
+        if (u.protocol === 'https:' && isPublicHostname(u.hostname)) endpoints.add(u.href);
+      } catch {
+        if (String(m[1]).startsWith('/')) endpoints.add(String(m[1]));
+      }
+    }
+  }
+
+  const fieldPatterns = [
+    /\b(email|username|user|login|identifier)\b\s*[:=]/gi,
+    /\b(password|senha|pass)\b\s*[:=]/gi
+  ];
+  for (const pattern of fieldPatterns) {
+    let m;
+    while ((m = pattern.exec(s)) && fields.size < 8) fields.add(String(m[1]).toLowerCase());
+  }
+
+  const hasCredentialFields = [...fields].some(x => ['email','username','user','login','identifier'].includes(x)) &&
+    [...fields].some(x => ['password','senha','pass'].includes(x));
+  const hasSubmitCode = /fetch\s*\(|axios\.(?:post|put)\s*\(|XMLHttpRequest|graphql|mutation\s+[A-Za-z0-9_]*(?:login|signin|auth)/i.test(s);
+
+  if (endpoints.size) hints.push({ provider: 'custom-api', evidence: `Fluxo de login customizado; endpoint(s): ${[...endpoints].slice(0, 3).join(', ')}` });
+  if (hasCredentialFields) hints.push({ provider: 'custom-api', evidence: `Campos de credencial detectados: ${[...fields].join(', ')}` });
+  if (hasSubmitCode) hints.push({ provider: 'custom-api', evidence: 'Código cliente envia autenticação por API/GraphQL/XHR' });
+
+  return { hints, endpoints: [...endpoints].slice(0, 8), fields: [...fields].slice(0, 8) };
+}
+
+function providerSignals(text, baseUrl) {
   const s = String(text || '');
   const low = s.toLowerCase();
   const hits = [];
@@ -106,7 +151,10 @@ function providerSignals(text) {
   if (/accounts\.google\.com\/gsi|google\.accounts\.id|google-signin-client_id/i.test(s)) add('google-identity', 'Google Identity Services');
   if (/next-auth|nextauth|\/api\/auth\/(signin|session)|authjs/i.test(s)) add('authjs', 'Auth.js / NextAuth');
   if (/wordpress|wp-login\.php|wp-json/i.test(low)) add('wordpress', 'WordPress');
-  return hits;
+
+  const custom = extractCustomAuthHints(s, baseUrl);
+  hits.push(...custom.hints);
+  return { hits, custom };
 }
 
 function chooseProvider(allSignals, firebaseConfig) {
@@ -115,13 +163,19 @@ function chooseProvider(allSignals, firebaseConfig) {
   for (const provider of order) {
     if (allSignals.some(x => x.provider === provider)) return { provider, confidence: 'medium', adapter: 'detection-only' };
   }
+  const customCount = allSignals.filter(x => x.provider === 'custom-api').length;
+  if (customCount >= 2) return { provider: 'custom-api', confidence: 'medium', adapter: 'detection-only' };
+  if (customCount === 1) return { provider: 'custom-api', confidence: 'low', adapter: 'detection-only' };
   return { provider: 'custom-or-unknown', confidence: 'low', adapter: 'detection-only' };
 }
 
 async function discoverAuth(target) {
   const first = await readTextLimited(target);
   let firebaseConfig = extractFirebaseConfig(first.text);
-  const signals = providerSignals(first.text);
+  const firstSignals = providerSignals(first.text, first.finalUrl);
+  const signals = [...firstSignals.hits];
+  const customEndpoints = new Set(firstSignals.custom.endpoints);
+  const customFields = new Set(firstSignals.custom.fields);
   const queue = extractModuleUrls(first.text, first.finalUrl).slice(0, 12).map(href => ({ href, depth: 0 }));
   const visited = new Set();
 
@@ -135,7 +189,10 @@ async function discoverAuth(target) {
       const loaded = await readTextLimited(moduleUrl);
       const cfg = extractFirebaseConfig(loaded.text);
       if (!firebaseConfig.apiKey && cfg.apiKey) firebaseConfig = cfg;
-      signals.push(...providerSignals(loaded.text));
+      const found = providerSignals(loaded.text, loaded.finalUrl);
+      signals.push(...found.hits);
+      found.custom.endpoints.forEach(x => customEndpoints.add(x));
+      found.custom.fields.forEach(x => customFields.add(x));
       if (item.depth < 2) {
         for (const href of extractModuleUrls(loaded.text, loaded.finalUrl).slice(0, 10)) {
           if (!visited.has(href)) queue.push({ href, depth: item.depth + 1 });
@@ -145,11 +202,18 @@ async function discoverAuth(target) {
   }
 
   const chosen = chooseProvider(signals, firebaseConfig);
-  const evidence = [...new Set(signals.filter(x => chosen.provider === 'custom-or-unknown' || x.provider === chosen.provider).map(x => x.evidence))].slice(0, 5);
+  const evidence = [...new Set(signals
+    .filter(x => chosen.provider === 'custom-or-unknown' || x.provider === chosen.provider)
+    .map(x => x.evidence))].slice(0, 8);
+
   return {
     ...chosen,
     evidence,
     firebaseConfig,
+    customAuth: {
+      endpoints: [...customEndpoints].slice(0, 8),
+      fields: [...customFields].slice(0, 8)
+    },
     scannedScripts: visited.size,
     finalOrigin: first.finalUrl.origin
   };
@@ -176,6 +240,7 @@ async function handleProviderDetect(request) {
       confidence: discovery.confidence,
       adapter: discovery.adapter,
       evidence: discovery.evidence,
+      customAuth: discovery.customAuth,
       scannedScripts: discovery.scannedScripts,
       finalOrigin: discovery.finalOrigin,
       latencyMs: Date.now() - started
@@ -215,8 +280,12 @@ async function handleUrlAuthTest(request) {
       provider: discovery.provider,
       confidence: discovery.confidence,
       authType: discovery.adapter,
+      evidence: discovery.evidence,
+      customAuth: discovery.customAuth,
       latencyMs: Date.now() - started,
-      message: 'Provedor detectado, mas o LIMPO ainda não possui adaptador ativo para testar credencial/rate limit deste fluxo.'
+      message: discovery.provider === 'custom-api'
+        ? 'Fluxo de autenticação customizado detectado, mas o LIMPO ainda não executa credenciais automaticamente nesse endpoint.'
+        : 'Provedor detectado, mas o LIMPO ainda não possui adaptador ativo para testar credencial/rate limit deste fluxo.'
     }, 422);
   }
 
