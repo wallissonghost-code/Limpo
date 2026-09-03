@@ -1,3 +1,5 @@
+import { detectAuthProviders } from './auth-detector.js';
+
 const WINDOW_MS = 10_000;
 const MAX_ATTEMPTS = 5;
 const LOCK_MS = 15_000;
@@ -24,11 +26,11 @@ async function sha256(text) {
 }
 
 function normalizeTarget(raw) {
-  let url;
-  try { url = new URL(String(raw || '').trim()); } catch { return null; }
-  if (url.protocol !== 'https:' || url.username || url.password) return null;
-  if (url.port && url.port !== '443') return null;
-  return url;
+  try {
+    const url = new URL(String(raw || '').trim());
+    if (url.protocol !== 'https:' || url.username || url.password || (url.port && url.port !== '443')) return null;
+    return url;
+  } catch { return null; }
 }
 
 function isPublicHostname(hostname) {
@@ -37,269 +39,41 @@ function isPublicHostname(hostname) {
   if (host === '0.0.0.0' || host === '::1' || host === '[::1]') return false;
   if (/^127\./.test(host) || /^10\./.test(host) || /^192\.168\./.test(host) || /^169\.254\./.test(host)) return false;
   const m = host.match(/^172\.(\d+)\./);
-  if (m && Number(m[1]) >= 16 && Number(m[1]) <= 31) return false;
-  return true;
+  return !(m && Number(m[1]) >= 16 && Number(m[1]) <= 31);
 }
 
 function validateAuthorizedTarget(raw, authorized) {
   const target = normalizeTarget(raw);
-  if (!authorized) return { error: json({ ok: false, error: 'authorization_required', classification: 'indeterminate' }, 400) };
-  if (!target || !isPublicHostname(target.hostname)) {
-    return { error: json({ ok: false, error: 'target_not_allowed', classification: 'indeterminate', message: 'Use apenas uma URL HTTPS pública que você tenha autorização para testar.' }, 403) };
-  }
+  if (!authorized) return { error: json({ ok:false, error:'authorization_required', classification:'indeterminate' }, 400) };
+  if (!target || !isPublicHostname(target.hostname)) return { error: json({ ok:false, error:'target_not_allowed', classification:'indeterminate', message:'Use apenas uma URL HTTPS pública que você tenha autorização para testar.' }, 403) };
   return { target };
 }
 
-function extractFirebaseConfig(text) {
-  const source = String(text || '');
+function summarizeDiscovery(discovery) {
+  const firebaseHint = discovery?.adapterHints?.firebase;
+  const activeAdapter = discovery?.provider === 'firebase' && firebaseHint?.apiKey ? 'firebase-password' : 'detection-only';
   return {
-    apiKey: source.match(/apiKey\s*[:=]\s*["'`]([^"'`]+)["'`]/i)?.[1] || '',
-    authDomain: source.match(/authDomain\s*[:=]\s*["'`]([^"'`]+)["'`]/i)?.[1] || '',
-    projectId: source.match(/projectId\s*[:=]\s*["'`]([^"'`]+)["'`]/i)?.[1] || ''
+    provider: discovery?.provider || 'custom-or-unknown',
+    confidence: discovery?.confidence || 'low',
+    type: discovery?.type || 'authentication',
+    adapter: activeAdapter,
+    detections: discovery?.detections || [],
+    endpoints: discovery?.endpoints || [],
+    externalOrigins: discovery?.externalOrigins || [],
+    cookies: discovery?.cookies || [],
+    storage: discovery?.storage || { localStorage:[], sessionStorage:[] },
+    jwtClaims: discovery?.jwtClaims || [],
+    oidcMetadata: discovery?.oidcMetadata || [],
+    responseHeaders: discovery?.responseHeaders || {},
+    customAuth: discovery?.customAuth || null,
+    scannedScripts: discovery?.scannedScripts || 0,
+    finalOrigin: discovery?.finalOrigin || null,
+    evidence: discovery?.detections?.[0]?.evidence || []
   };
 }
 
-function extractModuleUrls(text, baseUrl) {
-  const found = new Set();
-  const source = String(text || '');
-  const patterns = [
-    /<script[^>]+src=["']([^"']+)["'][^>]*>/gi,
-    /(?:import\s+(?:[^"']+?\s+from\s+)?|import\s*\()["']([^"']+)["']/g
-  ];
-  for (const pattern of patterns) {
-    let match;
-    while ((match = pattern.exec(source))) {
-      try {
-        const u = new URL(match[1], baseUrl);
-        if (u.origin === baseUrl.origin && u.protocol === 'https:' && isPublicHostname(u.hostname)) found.add(u.href);
-      } catch {}
-    }
-  }
-  return [...found];
-}
-
-async function readTextLimited(url) {
-  const response = await fetch(url, { redirect: 'follow', headers: { 'User-Agent': 'LIMPO-Authorized-Auth-Audit/2.3' } });
-  if (!response.ok) throw new Error(`target_http_${response.status}`);
-  const finalUrl = new URL(response.url || url.href || String(url));
-  if (!isPublicHostname(finalUrl.hostname) || finalUrl.protocol !== 'https:') throw new Error('unsafe_redirect');
-  const length = Number(response.headers.get('content-length') || 0);
-  if (length > 1_500_000) throw new Error('target_too_large');
-  return { text: (await response.text()).slice(0, 1_500_000), finalUrl };
-}
-
-function resolveLiteralVariables(source) {
-  const vars = new Map();
-  const re = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*["'`]([^"'`]{1,220})["'`]/g;
-  let m;
-  while ((m = re.exec(source)) && vars.size < 80) vars.set(m[1], m[2]);
-  return vars;
-}
-
-function extractCustomAuthHints(text, baseUrl) {
-  const s = String(text || '');
-  const hints = [];
-  const endpoints = new Set();
-  const fields = new Set();
-  const methods = new Set();
-  const transports = new Set();
-  const vars = resolveLiteralVariables(s);
-
-  const addEndpoint = raw => {
-    let value = String(raw || '').trim();
-    if (!value) return;
-    value = value.replace(/^['"`]|['"`]$/g, '');
-    try {
-      const u = new URL(value, baseUrl);
-      if (u.protocol === 'https:' && isPublicHostname(u.hostname)) endpoints.add(u.href);
-    } catch {
-      if (value.startsWith('/')) endpoints.add(value);
-    }
-  };
-
-  let m;
-
-  const directCall = /(?:axios\.|\b([A-Za-z_$][\w$]*)\.)(post|put|patch|get)\s*\(\s*(["'`])([^"'`]{1,220})\3/gi;
-  while ((m = directCall.exec(s)) && endpoints.size < 16) {
-    const path = m[4];
-    if (!/(login|signin|sign-in|auth|session|token)/i.test(path)) continue;
-    methods.add(m[2].toUpperCase());
-    transports.add('axios/wrapper');
-    addEndpoint(path);
-  }
-
-  const fetchLiteral = /fetch\s*\(\s*(["'`])([^"'`]{1,220})\1\s*(?:,\s*\{([\s\S]{0,800}?)\})?/gi;
-  while ((m = fetchLiteral.exec(s)) && endpoints.size < 16) {
-    if (!/(login|signin|sign-in|auth|session|token)/i.test(m[2])) continue;
-    addEndpoint(m[2]);
-    const method = String(m[3] || '').match(/method\s*:\s*["'`](POST|PUT|PATCH|GET)["'`]/i)?.[1] || 'GET';
-    methods.add(method.toUpperCase());
-    transports.add('fetch');
-  }
-
-  const concatCall = /(?:fetch|[A-Za-z_$][\w$]*\.(?:post|put|patch|get))\s*\(\s*([A-Za-z_$][\w$]*)\s*\+\s*(["'`])([^"'`]{1,160})\2/gi;
-  while ((m = concatCall.exec(s)) && endpoints.size < 16) {
-    const base = vars.get(m[1]);
-    const suffix = m[3];
-    if (!base || !/(login|signin|sign-in|auth|session|token)/i.test(suffix)) continue;
-    addEndpoint(base + suffix);
-    transports.add('constructed-url');
-  }
-
-  const templateCall = /(?:fetch|[A-Za-z_$][\w$]*\.(?:post|put|patch|get))\s*\(\s*`\$\{([A-Za-z_$][\w$]*)\}([^`]{1,160})`/gi;
-  while ((m = templateCall.exec(s)) && endpoints.size < 16) {
-    const base = vars.get(m[1]);
-    const suffix = m[2];
-    if (!base || !/(login|signin|sign-in|auth|session|token)/i.test(suffix)) continue;
-    addEndpoint(base + suffix);
-    transports.add('template-url');
-  }
-
-  const endpointLiteral = /["'`]((?:\/|https:\/\/)[^"'`]{0,180}(?:login|signin|sign-in|auth|session|token)[^"'`]*)["'`]/gi;
-  while ((m = endpointLiteral.exec(s)) && endpoints.size < 16) addEndpoint(m[1]);
-
-  const configuredBase = /\b(?:baseURL|apiURL|apiUrl|API_URL|VITE_API_URL|NEXT_PUBLIC_API_URL)\s*[:=]\s*["'`]([^"'`]{3,220})["'`]/gi;
-  while ((m = configuredBase.exec(s)) && endpoints.size < 16) {
-    if (/\/auth|\/api|login|signin/i.test(m[1])) addEndpoint(m[1]);
-  }
-
-  const genericMethodPattern = /\bmethod\s*:\s*["'`](POST|PUT|PATCH|GET)["'`]/gi;
-  while ((m = genericMethodPattern.exec(s)) && methods.size < 8) methods.add(m[1].toUpperCase());
-  if (/mutation\s+[A-Za-z0-9_]*(?:login|signin|auth)/i.test(s)) {
-    methods.add('POST');
-    transports.add('graphql');
-  }
-
-  const fieldPatterns = [
-    /\b(email|username|user|login|identifier)\b\s*[:=]/gi,
-    /\b(password|senha|pass)\b\s*[:=]/gi,
-    /["'](email|username|user|login|identifier|password|senha|pass)["']\s*:/gi
-  ];
-  for (const pattern of fieldPatterns) while ((m = pattern.exec(s)) && fields.size < 12) fields.add(String(m[1]).toLowerCase());
-
-  const bodyBlocks = [
-    ...s.matchAll(/JSON\.stringify\s*\(\s*\{([\s\S]{0,700}?)\}\s*\)/gi),
-    ...s.matchAll(/(?:data|body|variables|credentials)\s*[:=]\s*\{([\s\S]{0,700}?)\}/gi)
-  ];
-  for (const block of bodyBlocks.slice(0, 20)) {
-    const chunk = block[1] || '';
-    for (const fm of chunk.matchAll(/(?:^|[,\s])([A-Za-z_$][\w$]*)\s*:/g)) {
-      if (/^(email|username|user|login|identifier|password|senha|pass)$/i.test(fm[1])) fields.add(fm[1].toLowerCase());
-    }
-  }
-
-  const hasUser = [...fields].some(x => ['email','username','user','login','identifier'].includes(x));
-  const hasPass = [...fields].some(x => ['password','senha','pass'].includes(x));
-  const hasSubmitCode = /fetch\s*\(|axios\.|XMLHttpRequest|\.post\s*\(|\.put\s*\(|\.patch\s*\(|graphql|mutation\s+/i.test(s);
-
-  if (endpoints.size) hints.push({ provider: 'custom-api', evidence: `Endpoint(s) de autenticação: ${[...endpoints].slice(0, 4).join(', ')}` });
-  if (methods.size) hints.push({ provider: 'custom-api', evidence: `Método(s) observado(s): ${[...methods].join(', ')}` });
-  if (hasUser && hasPass) hints.push({ provider: 'custom-api', evidence: `Campos de credencial detectados: ${[...fields].join(', ')}` });
-  if (transports.size) hints.push({ provider: 'custom-api', evidence: `Transporte(s): ${[...transports].join(', ')}` });
-  if (hasSubmitCode) hints.push({ provider: 'custom-api', evidence: 'Código cliente envia autenticação por API/GraphQL/XHR' });
-
-  const score = (endpoints.size ? 2 : 0) + (methods.size ? 1 : 0) + (hasUser && hasPass ? 2 : 0) + (transports.size ? 1 : 0);
-  return {
-    hints,
-    endpoints: [...endpoints].slice(0, 10),
-    fields: [...fields].slice(0, 12),
-    methods: [...methods].slice(0, 8),
-    transports: [...transports].slice(0, 8),
-    score
-  };
-}
-
-function providerSignals(text, baseUrl) {
-  const s = String(text || '');
-  const low = s.toLowerCase();
-  const hits = [];
-  const add = (provider, evidence) => hits.push({ provider, evidence });
-
-  if (/firebase\/auth|firebase-auth|identitytoolkit\.googleapis\.com|authdomain\s*[:=]|initializeapp\s*\(/i.test(s)) add('firebase', 'Firebase Auth / Identity Toolkit');
-  if (/\.supabase\.co|supabase-js|createclient\s*\(/i.test(s) && /supabase/i.test(s)) add('supabase', 'Supabase client/auth');
-  if (/auth0\.com|@auth0|createauth0client|auth0client/i.test(s)) add('auth0', 'Auth0 SDK/domain');
-  if (/cognito-idp|amazoncognito|cognitouserpool|aws-amplify\/auth|userpoolid/i.test(s)) add('cognito', 'Amazon Cognito / Amplify Auth');
-  if (/clerk\.com|@clerk|clerkpublishablekey|clerk-js/i.test(s)) add('clerk', 'Clerk SDK/domain');
-  if (/accounts\.google\.com\/gsi|google\.accounts\.id|google-signin-client_id/i.test(s)) add('google-identity', 'Google Identity Services');
-  if (/next-auth|nextauth|\/api\/auth\/(signin|session)|authjs/i.test(s)) add('authjs', 'Auth.js / NextAuth');
-  if (/wordpress|wp-login\.php|wp-json/i.test(low)) add('wordpress', 'WordPress');
-
-  const custom = extractCustomAuthHints(s, baseUrl);
-  hits.push(...custom.hints);
-  return { hits, custom };
-}
-
-function chooseProvider(allSignals, firebaseConfig, customScore) {
-  if (firebaseConfig?.apiKey) return { provider: 'firebase', confidence: 'high', adapter: 'firebase-password' };
-  const order = ['supabase', 'auth0', 'cognito', 'clerk', 'google-identity', 'authjs', 'wordpress'];
-  for (const provider of order) if (allSignals.some(x => x.provider === provider)) return { provider, confidence: 'medium', adapter: 'detection-only' };
-  if (customScore >= 5) return { provider: 'custom-api', confidence: 'high', adapter: 'detection-only' };
-  if (customScore >= 3) return { provider: 'custom-api', confidence: 'medium', adapter: 'detection-only' };
-  if (allSignals.some(x => x.provider === 'custom-api')) return { provider: 'custom-api', confidence: 'low', adapter: 'detection-only' };
-  return { provider: 'custom-or-unknown', confidence: 'low', adapter: 'detection-only' };
-}
-
-async function discoverAuth(target) {
-  const first = await readTextLimited(target);
-  let firebaseConfig = extractFirebaseConfig(first.text);
-  const firstSignals = providerSignals(first.text, first.finalUrl);
-  const signals = [...firstSignals.hits];
-  const customEndpoints = new Set(firstSignals.custom.endpoints);
-  const customFields = new Set(firstSignals.custom.fields);
-  const customMethods = new Set(firstSignals.custom.methods);
-  const customTransports = new Set(firstSignals.custom.transports);
-  let customScore = firstSignals.custom.score;
-  const queue = extractModuleUrls(first.text, first.finalUrl).slice(0, 16).map(href => ({ href, depth: 0 }));
-  const visited = new Set();
-
-  while (queue.length && visited.size < 28) {
-    const item = queue.shift();
-    if (!item || visited.has(item.href)) continue;
-    visited.add(item.href);
-    try {
-      const moduleUrl = new URL(item.href);
-      if (moduleUrl.origin !== first.finalUrl.origin || !isPublicHostname(moduleUrl.hostname)) continue;
-      const loaded = await readTextLimited(moduleUrl);
-      const cfg = extractFirebaseConfig(loaded.text);
-      if (!firebaseConfig.apiKey && cfg.apiKey) firebaseConfig = cfg;
-      const found = providerSignals(loaded.text, loaded.finalUrl);
-      signals.push(...found.hits);
-      found.custom.endpoints.forEach(x => customEndpoints.add(x));
-      found.custom.fields.forEach(x => customFields.add(x));
-      found.custom.methods.forEach(x => customMethods.add(x));
-      found.custom.transports.forEach(x => customTransports.add(x));
-      customScore = Math.max(customScore, found.custom.score);
-      if (item.depth < 3) {
-        for (const href of extractModuleUrls(loaded.text, loaded.finalUrl).slice(0, 12)) {
-          if (!visited.has(href)) queue.push({ href, depth: item.depth + 1 });
-        }
-      }
-    } catch {}
-  }
-
-  const combinedScore = Math.min(6,
-    (customEndpoints.size ? 2 : 0) +
-    (customMethods.size ? 1 : 0) +
-    (customFields.size >= 2 ? 2 : 0) +
-    (customTransports.size ? 1 : 0)
-  );
-  const chosen = chooseProvider(signals, firebaseConfig, Math.max(customScore, combinedScore));
-  const evidence = [...new Set(signals.filter(x => chosen.provider === 'custom-or-unknown' || x.provider === chosen.provider).map(x => x.evidence))].slice(0, 12);
-
-  return {
-    ...chosen,
-    evidence,
-    firebaseConfig,
-    customAuth: {
-      endpoints: [...customEndpoints].slice(0, 10),
-      fields: [...customFields].slice(0, 12),
-      methods: [...customMethods].slice(0, 8),
-      transports: [...customTransports].slice(0, 8),
-      score: combinedScore
-    },
-    scannedScripts: visited.size,
-    finalOrigin: first.finalUrl.origin
-  };
+async function discover(target) {
+  return detectAuthProviders(target);
 }
 
 function classifyFirebaseError(code) {
@@ -316,11 +90,64 @@ async function handleProviderDetect(request) {
   if (checked.error) return checked.error;
   const started = Date.now();
   try {
-    const discovery = await discoverAuth(checked.target);
-    return json({ ok: true, provider: discovery.provider, confidence: discovery.confidence, adapter: discovery.adapter, evidence: discovery.evidence, customAuth: discovery.customAuth, scannedScripts: discovery.scannedScripts, finalOrigin: discovery.finalOrigin, latencyMs: Date.now() - started });
+    const discovery = await discover(checked.target);
+    return json({
+      ok:true,
+      ...summarizeDiscovery(discovery),
+      latencyMs:Date.now()-started,
+      limitations:{
+        browserStorage:'localStorage/sessionStorage de outro domínio não são lidos diretamente; somente nomes e referências expostos em conteúdo público são analisados.',
+        jwt:'JWTs privados e tokens de sessão não são coletados; somente padrões e nomes de claims expostos legitimamente são analisados.'
+      }
+    });
   } catch (error) {
-    return json({ ok: false, error: 'target_unreachable', classification: 'indeterminate', detail: String(error?.message || 'fetch_failed'), latencyMs: Date.now() - started }, 502);
+    return json({ ok:false, error:'target_unreachable', classification:'indeterminate', detail:String(error?.message || 'fetch_failed'), latencyMs:Date.now()-started }, 502);
   }
+}
+
+async function testFirebaseCredential(discovery, email, password, started) {
+  const config = discovery?.adapterHints?.firebase;
+  if (!config?.apiKey) return json({ ok:false, error:'adapter_configuration_missing', classification:'indeterminate', provider:'firebase', authType:'detection-only', latencyMs:Date.now()-started }, 422);
+
+  const endpoint = `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${encodeURIComponent(config.apiKey)}`;
+  let response, data;
+  try {
+    response = await fetch(endpoint, {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({ email, password, returnSecureToken:true })
+    });
+    data = await response.json().catch(()=>({}));
+  } catch {
+    return json({ ok:false, authenticated:false, classification:'indeterminate', provider:'firebase', authType:'firebase-password', error:'provider_unreachable', latencyMs:Date.now()-started }, 502);
+  }
+
+  const latencyMs = Date.now()-started;
+  if (response.ok && data?.localId) return json({
+    ok:true,
+    authenticated:true,
+    classification:'authenticated',
+    provider:'firebase',
+    authType:'firebase-password',
+    providerHttpStatus:response.status,
+    latencyMs
+  });
+
+  const providerCode = String(data?.error?.message || 'AUTH_FAILED');
+  const classification = classifyFirebaseError(providerCode);
+  const status = classification === 'blocked' ? 429 : classification === 'invalid' ? 401 : 422;
+  return json({
+    ok:false,
+    authenticated:false,
+    classification,
+    provider:'firebase',
+    authType:'firebase-password',
+    error:classification === 'blocked' ? 'rate_limited' : classification === 'invalid' ? 'invalid_credentials' : 'indeterminate_auth_result',
+    providerCode,
+    providerHttpStatus:response.status,
+    retryAfter:response.headers.get('retry-after') || null,
+    latencyMs
+  }, status);
 }
 
 async function handleUrlAuthTest(request) {
@@ -328,65 +155,32 @@ async function handleUrlAuthTest(request) {
   try { body = await request.json(); } catch {}
   const checked = validateAuthorizedTarget(body?.url, body?.authorized === true);
   if (checked.error) return checked.error;
-  const target = checked.target;
   const email = String(body?.email || '').trim();
   const password = String(body?.password || '');
-  if (!email || !password || email.length > 254 || password.length > 256) return json({ ok: false, error: 'invalid_input', classification: 'indeterminate' }, 400);
+  if (!email || !password || email.length > 254 || password.length > 256) return json({ ok:false, error:'invalid_input', classification:'indeterminate' }, 400);
 
   const started = Date.now();
   let discovery;
-  try { discovery = await discoverAuth(target); }
-  catch (error) { return json({ ok: false, error: 'target_unreachable', classification: 'indeterminate', detail: String(error?.message || 'fetch_failed') }, 502); }
+  try { discovery = await discover(checked.target); }
+  catch (error) { return json({ ok:false, error:'target_unreachable', classification:'indeterminate', detail:String(error?.message || 'fetch_failed'), latencyMs:Date.now()-started }, 502); }
 
-  if (discovery.provider !== 'firebase' || !discovery.firebaseConfig?.apiKey) {
-    return json({
-      ok: false,
-      error: 'adapter_not_available',
-      classification: 'indeterminate',
-      provider: discovery.provider,
-      confidence: discovery.confidence,
-      authType: discovery.adapter,
-      evidence: discovery.evidence,
-      customAuth: discovery.customAuth,
-      latencyMs: Date.now() - started,
-      message: discovery.provider === 'custom-api'
-        ? 'Fluxo customizado detectado. O LIMPO mostra endpoint/método/campos quando encontrados, mas não envia credenciais automaticamente a um endpoint customizado desconhecido.'
-        : 'Provedor detectado, mas o LIMPO ainda não possui adaptador ativo para testar credencial/rate limit deste fluxo.'
-    }, 422);
-  }
+  if (discovery.provider === 'firebase' && discovery?.adapterHints?.firebase?.apiKey) return testFirebaseCredential(discovery, email, password, started);
 
-  const config = discovery.firebaseConfig;
-  const endpoint = `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${encodeURIComponent(config.apiKey)}`;
-  let authResponse, data;
-  try {
-    authResponse = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, password, returnSecureToken: true }) });
-    data = await authResponse.json().catch(() => ({}));
-  } catch {
-    return json({ ok: false, authenticated: false, classification: 'indeterminate', provider: 'firebase', authType: 'firebase-password', error: 'provider_unreachable', latencyMs: Date.now() - started }, 502);
-  }
-
-  const latencyMs = Date.now() - started;
-  if (authResponse.ok && data?.localId) {
-    return json({ ok: true, authenticated: true, classification: 'authenticated', provider: 'firebase', authType: 'firebase-password', projectId: config.projectId || null, authDomain: config.authDomain || null, providerHttpStatus: authResponse.status, latencyMs });
-  }
-
-  const firebaseCode = String(data?.error?.message || 'AUTH_FAILED');
-  const classification = classifyFirebaseError(firebaseCode);
-  const status = classification === 'blocked' ? 429 : classification === 'invalid' ? 401 : 422;
+  const summary = summarizeDiscovery(discovery);
   return json({
-    ok: false,
-    authenticated: false,
-    classification,
-    provider: 'firebase',
-    authType: 'firebase-password',
-    projectId: config.projectId || null,
-    authDomain: config.authDomain || null,
-    error: classification === 'blocked' ? 'rate_limited' : classification === 'invalid' ? 'invalid_credentials' : 'indeterminate_auth_result',
-    providerCode: firebaseCode,
-    providerHttpStatus: authResponse.status,
-    retryAfter: authResponse.headers.get('retry-after') || null,
-    latencyMs
-  }, status);
+    ok:false,
+    error:'adapter_not_available',
+    classification:'indeterminate',
+    provider:summary.provider,
+    confidence:summary.confidence,
+    authType:'detection-only',
+    evidence:summary.evidence,
+    customAuth:summary.customAuth,
+    latencyMs:Date.now()-started,
+    message:summary.provider === 'custom-api'
+      ? 'Fluxo customizado detectado. O LIMPO não envia credenciais automaticamente para um endpoint desconhecido.'
+      : 'O provedor foi detectado, mas não existe adaptador ativo e seguro para teste de credencial neste fluxo.'
+  }, 422);
 }
 
 export class LoginLimiter {
@@ -398,19 +192,19 @@ export class LoginLimiter {
     const stateKey = `state:${mode}`;
     const now = Date.now();
     const stored = await this.ctx.storage.get(stateKey);
-    const state = stored || { hits: [], lockedUntil: 0, total: 0 };
+    const state = stored || { hits:[], lockedUntil:0, total:0 };
 
     if (state.lockedUntil > now) {
-      const retryAfterMs = state.lockedUntil - now;
-      return json({ ok: false, error: 'locked', retryAfterMs, totalAttempts: state.total }, 429, { 'Retry-After': String(Math.ceil(retryAfterMs / 1000)) });
+      const retryAfterMs = state.lockedUntil-now;
+      return json({ ok:false, error:'locked', retryAfterMs, totalAttempts:state.total }, 429, { 'Retry-After':String(Math.ceil(retryAfterMs/1000)) });
     }
 
-    state.hits = state.hits.filter(t => now - t < WINDOW_MS);
+    state.hits = state.hits.filter(t=>now-t<WINDOW_MS);
     if (state.hits.length >= MAX_ATTEMPTS) {
-      state.lockedUntil = now + LOCK_MS;
+      state.lockedUntil = now+LOCK_MS;
       state.hits = [];
       await this.ctx.storage.put(stateKey, state);
-      return json({ ok: false, error: 'rate_limited', retryAfterMs: LOCK_MS, totalAttempts: state.total }, 429, { 'Retry-After': String(Math.ceil(LOCK_MS / 1000)) });
+      return json({ ok:false, error:'rate_limited', retryAfterMs:LOCK_MS, totalAttempts:state.total }, 429, { 'Retry-After':String(Math.ceil(LOCK_MS/1000)) });
     }
 
     let body = {};
@@ -426,7 +220,7 @@ export class LoginLimiter {
       valid = username === LAB_USER && passwordHash === LAB_PASSWORD_SHA256;
       successMessage = 'Login fictício autorizado';
     } else {
-      const pin = String(body?.pin ?? '').replace(/\D/g, '').slice(0, 6);
+      const pin = String(body?.pin ?? '').replace(/\D/g,'').slice(0,6);
       valid = pin === LAB_PIN;
       successMessage = 'PIN fictício correto';
     }
@@ -435,25 +229,25 @@ export class LoginLimiter {
       state.hits = [];
       state.lockedUntil = 0;
       await this.ctx.storage.put(stateKey, state);
-      return json({ ok: true, message: successMessage, totalAttempts: state.total });
+      return json({ ok:true, message:successMessage, totalAttempts:state.total });
     }
 
     await this.ctx.storage.put(stateKey, state);
-    return json({ ok: false, error: mode === 'password' ? 'invalid_credentials' : 'invalid_pin', remaining: Math.max(0, MAX_ATTEMPTS - state.hits.length), totalAttempts: state.total }, 401);
+    return json({ ok:false, error:mode === 'password' ? 'invalid_credentials' : 'invalid_pin', remaining:Math.max(0,MAX_ATTEMPTS-state.hits.length), totalAttempts:state.total }, 401);
   }
 }
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
+    if (request.method === 'OPTIONS') return new Response(null, { status:204, headers:cors });
 
     if (url.pathname === '/url-provider-detect') {
-      if (request.method !== 'POST') return json({ ok: false, error: 'method_not_allowed' }, 405);
+      if (request.method !== 'POST') return json({ ok:false, error:'method_not_allowed' }, 405);
       return handleProviderDetect(request);
     }
     if (url.pathname === '/url-auth-test') {
-      if (request.method !== 'POST') return json({ ok: false, error: 'method_not_allowed' }, 405);
+      if (request.method !== 'POST') return json({ ok:false, error:'method_not_allowed' }, 405);
       return handleUrlAuthTest(request);
     }
 
@@ -462,12 +256,12 @@ export default {
     const isPin = url.pathname === '/login' || url.pathname === '/api/login';
     const isApi = isSecureLogin || isVulnerableLogin || isPin;
     if (!isApi) return env.ASSETS.fetch(request);
-    if (request.method !== 'POST') return json({ ok: false, error: 'method_not_allowed' }, 405);
+    if (request.method !== 'POST') return json({ ok:false, error:'method_not_allowed' }, 405);
 
     let body = {};
     if (isVulnerableLogin) { try { body = await request.clone().json(); } catch {} }
     const ip = request.headers.get('CF-Connecting-IP') || 'lab-client';
-    const clientKey = isVulnerableLogin ? `vuln:${String(body?.labClientId || 'client-a').slice(0, 64)}` : `secure:${ip}`;
+    const clientKey = isVulnerableLogin ? `vuln:${String(body?.labClientId || 'client-a').slice(0,64)}` : `secure:${ip}`;
     const id = env.LOGIN_LIMITER.idFromName(clientKey);
     return env.LOGIN_LIMITER.get(id).fetch(request);
   }
