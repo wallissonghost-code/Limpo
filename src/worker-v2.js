@@ -124,6 +124,18 @@ async function authTest(request, env) {
   return legacyWorker.fetch(request, env);
 }
 
+async function withDiagnosticsModule(request, env) {
+  const response = await legacyWorker.fetch(request, env);
+  const type = String(response.headers.get('content-type') || '').toLowerCase();
+  if (request.method !== 'GET' || !type.includes('text/html') || !response.ok) return response;
+  const text = await response.text();
+  if (text.includes('/url-diagnostics.js')) return new Response(text, response);
+  const injected = text.replace('</body>', '<script src="/url-diagnostics.js"></script>\n</body>');
+  const headers = new Headers(response.headers);
+  headers.delete('content-length');
+  return new Response(injected, { status:response.status, statusText:response.statusText, headers });
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -136,6 +148,6 @@ export default {
       if (request.method !== 'POST') return json({ ok:false, error:'method_not_allowed' }, 405);
       return authTest(request, env);
     }
-    return legacyWorker.fetch(request, env);
+    return withDiagnosticsModule(request, env);
   }
 };
