@@ -26,8 +26,7 @@ async function sha256(text) {
 function normalizeTarget(raw) {
   let url;
   try { url = new URL(String(raw || '').trim()); } catch { return null; }
-  if (url.protocol !== 'https:') return null;
-  if (url.username || url.password) return null;
+  if (url.protocol !== 'https:' || url.username || url.password) return null;
   if (url.port && url.port !== '443') return null;
   return url;
 }
@@ -36,10 +35,9 @@ function isPublicHostname(hostname) {
   const host = String(hostname || '').trim().toLowerCase().replace(/\.$/, '');
   if (!host || host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local') || host.endsWith('.internal')) return false;
   if (host === '0.0.0.0' || host === '::1' || host === '[::1]') return false;
-  if (/^127\./.test(host) || /^10\./.test(host) || /^192\.168\./.test(host)) return false;
+  if (/^127\./.test(host) || /^10\./.test(host) || /^192\.168\./.test(host) || /^169\.254\./.test(host)) return false;
   const m = host.match(/^172\.(\d+)\./);
   if (m && Number(m[1]) >= 16 && Number(m[1]) <= 31) return false;
-  if (/^169\.254\./.test(host)) return false;
   return true;
 }
 
@@ -54,10 +52,11 @@ function validateAuthorizedTarget(raw, authorized) {
 
 function extractFirebaseConfig(text) {
   const source = String(text || '');
-  const apiKey = source.match(/apiKey\s*[:=]\s*["'`]([^"'`]+)["'`]/i)?.[1] || '';
-  const authDomain = source.match(/authDomain\s*[:=]\s*["'`]([^"'`]+)["'`]/i)?.[1] || '';
-  const projectId = source.match(/projectId\s*[:=]\s*["'`]([^"'`]+)["'`]/i)?.[1] || '';
-  return { apiKey, authDomain, projectId };
+  return {
+    apiKey: source.match(/apiKey\s*[:=]\s*["'`]([^"'`]+)["'`]/i)?.[1] || '',
+    authDomain: source.match(/authDomain\s*[:=]\s*["'`]([^"'`]+)["'`]/i)?.[1] || '',
+    projectId: source.match(/projectId\s*[:=]\s*["'`]([^"'`]+)["'`]/i)?.[1] || ''
+  };
 }
 
 function extractModuleUrls(text, baseUrl) {
@@ -80,10 +79,7 @@ function extractModuleUrls(text, baseUrl) {
 }
 
 async function readTextLimited(url) {
-  const response = await fetch(url, {
-    redirect: 'follow',
-    headers: { 'User-Agent': 'LIMPO-Authorized-Auth-Audit/2.2' }
-  });
+  const response = await fetch(url, { redirect: 'follow', headers: { 'User-Agent': 'LIMPO-Authorized-Auth-Audit/2.3' } });
   if (!response.ok) throw new Error(`target_http_${response.status}`);
   const finalUrl = new URL(response.url || url.href || String(url));
   if (!isPublicHostname(finalUrl.hostname) || finalUrl.protocol !== 'https:') throw new Error('unsafe_redirect');
@@ -92,16 +88,27 @@ async function readTextLimited(url) {
   return { text: (await response.text()).slice(0, 1_500_000), finalUrl };
 }
 
+function resolveLiteralVariables(source) {
+  const vars = new Map();
+  const re = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*["'`]([^"'`]{1,220})["'`]/g;
+  let m;
+  while ((m = re.exec(source)) && vars.size < 80) vars.set(m[1], m[2]);
+  return vars;
+}
+
 function extractCustomAuthHints(text, baseUrl) {
   const s = String(text || '');
   const hints = [];
   const endpoints = new Set();
   const fields = new Set();
   const methods = new Set();
+  const transports = new Set();
+  const vars = resolveLiteralVariables(s);
 
   const addEndpoint = raw => {
-    const value = String(raw || '').trim();
+    let value = String(raw || '').trim();
     if (!value) return;
+    value = value.replace(/^['"`]|['"`]$/g, '');
     try {
       const u = new URL(value, baseUrl);
       if (u.protocol === 'https:' && isPublicHostname(u.hostname)) endpoints.add(u.href);
@@ -110,55 +117,95 @@ function extractCustomAuthHints(text, baseUrl) {
     }
   };
 
-  const axiosPattern = /axios\.(post|put|patch|get)\s*\(\s*["'`]([^"'`]*(?:login|signin|sign-in|auth|session|token)[^"'`]*)["'`]/gi;
   let m;
-  while ((m = axiosPattern.exec(s)) && endpoints.size < 12) {
-    methods.add(String(m[1]).toUpperCase());
+
+  const directCall = /(?:axios\.|\b([A-Za-z_$][\w$]*)\.)(post|put|patch|get)\s*\(\s*(["'`])([^"'`]{1,220})\3/gi;
+  while ((m = directCall.exec(s)) && endpoints.size < 16) {
+    const path = m[4];
+    if (!/(login|signin|sign-in|auth|session|token)/i.test(path)) continue;
+    methods.add(m[2].toUpperCase());
+    transports.add('axios/wrapper');
+    addEndpoint(path);
+  }
+
+  const fetchLiteral = /fetch\s*\(\s*(["'`])([^"'`]{1,220})\1\s*(?:,\s*\{([\s\S]{0,800}?)\})?/gi;
+  while ((m = fetchLiteral.exec(s)) && endpoints.size < 16) {
+    if (!/(login|signin|sign-in|auth|session|token)/i.test(m[2])) continue;
     addEndpoint(m[2]);
+    const method = String(m[3] || '').match(/method\s*:\s*["'`](POST|PUT|PATCH|GET)["'`]/i)?.[1] || 'GET';
+    methods.add(method.toUpperCase());
+    transports.add('fetch');
   }
 
-  const fetchPattern = /fetch\s*\(\s*["'`]([^"'`]*(?:login|signin|sign-in|auth|session|token)[^"'`]*)["'`]\s*(?:,\s*\{([\s\S]{0,500}?)\})?/gi;
-  while ((m = fetchPattern.exec(s)) && endpoints.size < 12) {
-    addEndpoint(m[1]);
-    const opts = String(m[2] || '');
-    const method = opts.match(/method\s*:\s*["'`](POST|PUT|PATCH|GET)["'`]/i)?.[1];
-    methods.add(String(method || 'GET').toUpperCase());
+  const concatCall = /(?:fetch|[A-Za-z_$][\w$]*\.(?:post|put|patch|get))\s*\(\s*([A-Za-z_$][\w$]*)\s*\+\s*(["'`])([^"'`]{1,160})\2/gi;
+  while ((m = concatCall.exec(s)) && endpoints.size < 16) {
+    const base = vars.get(m[1]);
+    const suffix = m[3];
+    if (!base || !/(login|signin|sign-in|auth|session|token)/i.test(suffix)) continue;
+    addEndpoint(base + suffix);
+    transports.add('constructed-url');
   }
 
-  const endpointPatterns = [
-    /(?:url|endpoint|baseURL|apiUrl|apiURL)\s*[:=]\s*["'`]([^"'`]*(?:login|signin|sign-in|auth|session|token)[^"'`]*)["'`]/gi,
-    /["'`]((?:\/|https:\/\/)[^"'`]{0,160}\/(?:api\/)?(?:auth\/)?(?:login|signin|sign-in|session|token)[^"'`]*)["'`]/gi
-  ];
-  for (const pattern of endpointPatterns) {
-    while ((m = pattern.exec(s)) && endpoints.size < 12) addEndpoint(m[1]);
+  const templateCall = /(?:fetch|[A-Za-z_$][\w$]*\.(?:post|put|patch|get))\s*\(\s*`\$\{([A-Za-z_$][\w$]*)\}([^`]{1,160})`/gi;
+  while ((m = templateCall.exec(s)) && endpoints.size < 16) {
+    const base = vars.get(m[1]);
+    const suffix = m[2];
+    if (!base || !/(login|signin|sign-in|auth|session|token)/i.test(suffix)) continue;
+    addEndpoint(base + suffix);
+    transports.add('template-url');
+  }
+
+  const endpointLiteral = /["'`]((?:\/|https:\/\/)[^"'`]{0,180}(?:login|signin|sign-in|auth|session|token)[^"'`]*)["'`]/gi;
+  while ((m = endpointLiteral.exec(s)) && endpoints.size < 16) addEndpoint(m[1]);
+
+  const configuredBase = /\b(?:baseURL|apiURL|apiUrl|API_URL|VITE_API_URL|NEXT_PUBLIC_API_URL)\s*[:=]\s*["'`]([^"'`]{3,220})["'`]/gi;
+  while ((m = configuredBase.exec(s)) && endpoints.size < 16) {
+    if (/\/auth|\/api|login|signin/i.test(m[1])) addEndpoint(m[1]);
   }
 
   const genericMethodPattern = /\bmethod\s*:\s*["'`](POST|PUT|PATCH|GET)["'`]/gi;
-  while ((m = genericMethodPattern.exec(s)) && methods.size < 6) methods.add(String(m[1]).toUpperCase());
-  if (/mutation\s+[A-Za-z0-9_]*(?:login|signin|auth)/i.test(s)) methods.add('POST (GraphQL)');
+  while ((m = genericMethodPattern.exec(s)) && methods.size < 8) methods.add(m[1].toUpperCase());
+  if (/mutation\s+[A-Za-z0-9_]*(?:login|signin|auth)/i.test(s)) {
+    methods.add('POST');
+    transports.add('graphql');
+  }
 
   const fieldPatterns = [
     /\b(email|username|user|login|identifier)\b\s*[:=]/gi,
-    /\b(password|senha|pass)\b\s*[:=]/gi
+    /\b(password|senha|pass)\b\s*[:=]/gi,
+    /["'](email|username|user|login|identifier|password|senha|pass)["']\s*:/gi
   ];
-  for (const pattern of fieldPatterns) {
-    while ((m = pattern.exec(s)) && fields.size < 8) fields.add(String(m[1]).toLowerCase());
+  for (const pattern of fieldPatterns) while ((m = pattern.exec(s)) && fields.size < 12) fields.add(String(m[1]).toLowerCase());
+
+  const bodyBlocks = [
+    ...s.matchAll(/JSON\.stringify\s*\(\s*\{([\s\S]{0,700}?)\}\s*\)/gi),
+    ...s.matchAll(/(?:data|body|variables|credentials)\s*[:=]\s*\{([\s\S]{0,700}?)\}/gi)
+  ];
+  for (const block of bodyBlocks.slice(0, 20)) {
+    const chunk = block[1] || '';
+    for (const fm of chunk.matchAll(/(?:^|[,\s])([A-Za-z_$][\w$]*)\s*:/g)) {
+      if (/^(email|username|user|login|identifier|password|senha|pass)$/i.test(fm[1])) fields.add(fm[1].toLowerCase());
+    }
   }
 
-  const hasCredentialFields = [...fields].some(x => ['email','username','user','login','identifier'].includes(x)) &&
-    [...fields].some(x => ['password','senha','pass'].includes(x));
-  const hasSubmitCode = /fetch\s*\(|axios\.(?:post|put|patch)\s*\(|XMLHttpRequest|graphql|mutation\s+[A-Za-z0-9_]*(?:login|signin|auth)/i.test(s);
+  const hasUser = [...fields].some(x => ['email','username','user','login','identifier'].includes(x));
+  const hasPass = [...fields].some(x => ['password','senha','pass'].includes(x));
+  const hasSubmitCode = /fetch\s*\(|axios\.|XMLHttpRequest|\.post\s*\(|\.put\s*\(|\.patch\s*\(|graphql|mutation\s+/i.test(s);
 
-  if (endpoints.size) hints.push({ provider: 'custom-api', evidence: `Endpoint(s) de autenticação: ${[...endpoints].slice(0, 3).join(', ')}` });
+  if (endpoints.size) hints.push({ provider: 'custom-api', evidence: `Endpoint(s) de autenticação: ${[...endpoints].slice(0, 4).join(', ')}` });
   if (methods.size) hints.push({ provider: 'custom-api', evidence: `Método(s) observado(s): ${[...methods].join(', ')}` });
-  if (hasCredentialFields) hints.push({ provider: 'custom-api', evidence: `Campos de credencial detectados: ${[...fields].join(', ')}` });
+  if (hasUser && hasPass) hints.push({ provider: 'custom-api', evidence: `Campos de credencial detectados: ${[...fields].join(', ')}` });
+  if (transports.size) hints.push({ provider: 'custom-api', evidence: `Transporte(s): ${[...transports].join(', ')}` });
   if (hasSubmitCode) hints.push({ provider: 'custom-api', evidence: 'Código cliente envia autenticação por API/GraphQL/XHR' });
 
+  const score = (endpoints.size ? 2 : 0) + (methods.size ? 1 : 0) + (hasUser && hasPass ? 2 : 0) + (transports.size ? 1 : 0);
   return {
     hints,
-    endpoints: [...endpoints].slice(0, 8),
-    fields: [...fields].slice(0, 8),
-    methods: [...methods].slice(0, 6)
+    endpoints: [...endpoints].slice(0, 10),
+    fields: [...fields].slice(0, 12),
+    methods: [...methods].slice(0, 8),
+    transports: [...transports].slice(0, 8),
+    score
   };
 }
 
@@ -182,16 +229,13 @@ function providerSignals(text, baseUrl) {
   return { hits, custom };
 }
 
-function chooseProvider(allSignals, firebaseConfig) {
+function chooseProvider(allSignals, firebaseConfig, customScore) {
   if (firebaseConfig?.apiKey) return { provider: 'firebase', confidence: 'high', adapter: 'firebase-password' };
   const order = ['supabase', 'auth0', 'cognito', 'clerk', 'google-identity', 'authjs', 'wordpress'];
-  for (const provider of order) {
-    if (allSignals.some(x => x.provider === provider)) return { provider, confidence: 'medium', adapter: 'detection-only' };
-  }
-  const customCount = allSignals.filter(x => x.provider === 'custom-api').length;
-  if (customCount >= 3) return { provider: 'custom-api', confidence: 'high', adapter: 'detection-only' };
-  if (customCount >= 2) return { provider: 'custom-api', confidence: 'medium', adapter: 'detection-only' };
-  if (customCount === 1) return { provider: 'custom-api', confidence: 'low', adapter: 'detection-only' };
+  for (const provider of order) if (allSignals.some(x => x.provider === provider)) return { provider, confidence: 'medium', adapter: 'detection-only' };
+  if (customScore >= 5) return { provider: 'custom-api', confidence: 'high', adapter: 'detection-only' };
+  if (customScore >= 3) return { provider: 'custom-api', confidence: 'medium', adapter: 'detection-only' };
+  if (allSignals.some(x => x.provider === 'custom-api')) return { provider: 'custom-api', confidence: 'low', adapter: 'detection-only' };
   return { provider: 'custom-or-unknown', confidence: 'low', adapter: 'detection-only' };
 }
 
@@ -203,10 +247,12 @@ async function discoverAuth(target) {
   const customEndpoints = new Set(firstSignals.custom.endpoints);
   const customFields = new Set(firstSignals.custom.fields);
   const customMethods = new Set(firstSignals.custom.methods);
-  const queue = extractModuleUrls(first.text, first.finalUrl).slice(0, 12).map(href => ({ href, depth: 0 }));
+  const customTransports = new Set(firstSignals.custom.transports);
+  let customScore = firstSignals.custom.score;
+  const queue = extractModuleUrls(first.text, first.finalUrl).slice(0, 16).map(href => ({ href, depth: 0 }));
   const visited = new Set();
 
-  while (queue.length && visited.size < 20) {
+  while (queue.length && visited.size < 28) {
     const item = queue.shift();
     if (!item || visited.has(item.href)) continue;
     visited.add(item.href);
@@ -221,27 +267,35 @@ async function discoverAuth(target) {
       found.custom.endpoints.forEach(x => customEndpoints.add(x));
       found.custom.fields.forEach(x => customFields.add(x));
       found.custom.methods.forEach(x => customMethods.add(x));
-      if (item.depth < 2) {
-        for (const href of extractModuleUrls(loaded.text, loaded.finalUrl).slice(0, 10)) {
+      found.custom.transports.forEach(x => customTransports.add(x));
+      customScore = Math.max(customScore, found.custom.score);
+      if (item.depth < 3) {
+        for (const href of extractModuleUrls(loaded.text, loaded.finalUrl).slice(0, 12)) {
           if (!visited.has(href)) queue.push({ href, depth: item.depth + 1 });
         }
       }
     } catch {}
   }
 
-  const chosen = chooseProvider(signals, firebaseConfig);
-  const evidence = [...new Set(signals
-    .filter(x => chosen.provider === 'custom-or-unknown' || x.provider === chosen.provider)
-    .map(x => x.evidence))].slice(0, 10);
+  const combinedScore = Math.min(6,
+    (customEndpoints.size ? 2 : 0) +
+    (customMethods.size ? 1 : 0) +
+    (customFields.size >= 2 ? 2 : 0) +
+    (customTransports.size ? 1 : 0)
+  );
+  const chosen = chooseProvider(signals, firebaseConfig, Math.max(customScore, combinedScore));
+  const evidence = [...new Set(signals.filter(x => chosen.provider === 'custom-or-unknown' || x.provider === chosen.provider).map(x => x.evidence))].slice(0, 12);
 
   return {
     ...chosen,
     evidence,
     firebaseConfig,
     customAuth: {
-      endpoints: [...customEndpoints].slice(0, 8),
-      fields: [...customFields].slice(0, 8),
-      methods: [...customMethods].slice(0, 6)
+      endpoints: [...customEndpoints].slice(0, 10),
+      fields: [...customFields].slice(0, 12),
+      methods: [...customMethods].slice(0, 8),
+      transports: [...customTransports].slice(0, 8),
+      score: combinedScore
     },
     scannedScripts: visited.size,
     finalOrigin: first.finalUrl.origin
@@ -263,17 +317,7 @@ async function handleProviderDetect(request) {
   const started = Date.now();
   try {
     const discovery = await discoverAuth(checked.target);
-    return json({
-      ok: true,
-      provider: discovery.provider,
-      confidence: discovery.confidence,
-      adapter: discovery.adapter,
-      evidence: discovery.evidence,
-      customAuth: discovery.customAuth,
-      scannedScripts: discovery.scannedScripts,
-      finalOrigin: discovery.finalOrigin,
-      latencyMs: Date.now() - started
-    });
+    return json({ ok: true, provider: discovery.provider, confidence: discovery.confidence, adapter: discovery.adapter, evidence: discovery.evidence, customAuth: discovery.customAuth, scannedScripts: discovery.scannedScripts, finalOrigin: discovery.finalOrigin, latencyMs: Date.now() - started });
   } catch (error) {
     return json({ ok: false, error: 'target_unreachable', classification: 'indeterminate', detail: String(error?.message || 'fetch_failed'), latencyMs: Date.now() - started }, 502);
   }
@@ -282,24 +326,17 @@ async function handleProviderDetect(request) {
 async function handleUrlAuthTest(request) {
   let body = {};
   try { body = await request.json(); } catch {}
-
   const checked = validateAuthorizedTarget(body?.url, body?.authorized === true);
   if (checked.error) return checked.error;
   const target = checked.target;
   const email = String(body?.email || '').trim();
   const password = String(body?.password || '');
-
-  if (!email || !password || email.length > 254 || password.length > 256) {
-    return json({ ok: false, error: 'invalid_input', classification: 'indeterminate' }, 400);
-  }
+  if (!email || !password || email.length > 254 || password.length > 256) return json({ ok: false, error: 'invalid_input', classification: 'indeterminate' }, 400);
 
   const started = Date.now();
   let discovery;
-  try {
-    discovery = await discoverAuth(target);
-  } catch (error) {
-    return json({ ok: false, error: 'target_unreachable', classification: 'indeterminate', detail: String(error?.message || 'fetch_failed') }, 502);
-  }
+  try { discovery = await discoverAuth(target); }
+  catch (error) { return json({ ok: false, error: 'target_unreachable', classification: 'indeterminate', detail: String(error?.message || 'fetch_failed') }, 502); }
 
   if (discovery.provider !== 'firebase' || !discovery.firebaseConfig?.apiKey) {
     return json({
@@ -313,21 +350,16 @@ async function handleUrlAuthTest(request) {
       customAuth: discovery.customAuth,
       latencyMs: Date.now() - started,
       message: discovery.provider === 'custom-api'
-        ? 'Fluxo de autenticação customizado detectado, mas o LIMPO ainda não executa credenciais automaticamente nesse endpoint.'
+        ? 'Fluxo customizado detectado. O LIMPO mostra endpoint/método/campos quando encontrados, mas não envia credenciais automaticamente a um endpoint customizado desconhecido.'
         : 'Provedor detectado, mas o LIMPO ainda não possui adaptador ativo para testar credencial/rate limit deste fluxo.'
     }, 422);
   }
 
   const config = discovery.firebaseConfig;
   const endpoint = `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${encodeURIComponent(config.apiKey)}`;
-  let authResponse;
-  let data;
+  let authResponse, data;
   try {
-    authResponse = await fetch(endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password, returnSecureToken: true })
-    });
+    authResponse = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, password, returnSecureToken: true }) });
     data = await authResponse.json().catch(() => ({}));
   } catch {
     return json({ ok: false, authenticated: false, classification: 'indeterminate', provider: 'firebase', authType: 'firebase-password', error: 'provider_unreachable', latencyMs: Date.now() - started }, 502);
@@ -335,24 +367,12 @@ async function handleUrlAuthTest(request) {
 
   const latencyMs = Date.now() - started;
   if (authResponse.ok && data?.localId) {
-    return json({
-      ok: true,
-      authenticated: true,
-      classification: 'authenticated',
-      provider: 'firebase',
-      authType: 'firebase-password',
-      projectId: config.projectId || null,
-      authDomain: config.authDomain || null,
-      providerHttpStatus: authResponse.status,
-      latencyMs
-    });
+    return json({ ok: true, authenticated: true, classification: 'authenticated', provider: 'firebase', authType: 'firebase-password', projectId: config.projectId || null, authDomain: config.authDomain || null, providerHttpStatus: authResponse.status, latencyMs });
   }
 
   const firebaseCode = String(data?.error?.message || 'AUTH_FAILED');
   const classification = classifyFirebaseError(firebaseCode);
   const status = classification === 'blocked' ? 429 : classification === 'invalid' ? 401 : 422;
-  const retryAfter = authResponse.headers.get('retry-after');
-
   return json({
     ok: false,
     authenticated: false,
@@ -364,15 +384,13 @@ async function handleUrlAuthTest(request) {
     error: classification === 'blocked' ? 'rate_limited' : classification === 'invalid' ? 'invalid_credentials' : 'indeterminate_auth_result',
     providerCode: firebaseCode,
     providerHttpStatus: authResponse.status,
-    retryAfter: retryAfter || null,
+    retryAfter: authResponse.headers.get('retry-after') || null,
     latencyMs
   }, status);
 }
 
 export class LoginLimiter {
-  constructor(ctx) {
-    this.ctx = ctx;
-  }
+  constructor(ctx) { this.ctx = ctx; }
 
   async fetch(request) {
     const url = new URL(request.url);
@@ -384,9 +402,7 @@ export class LoginLimiter {
 
     if (state.lockedUntil > now) {
       const retryAfterMs = state.lockedUntil - now;
-      return json({ ok: false, error: 'locked', retryAfterMs, totalAttempts: state.total }, 429, {
-        'Retry-After': String(Math.ceil(retryAfterMs / 1000))
-      });
+      return json({ ok: false, error: 'locked', retryAfterMs, totalAttempts: state.total }, 429, { 'Retry-After': String(Math.ceil(retryAfterMs / 1000)) });
     }
 
     state.hits = state.hits.filter(t => now - t < WINDOW_MS);
@@ -394,9 +410,7 @@ export class LoginLimiter {
       state.lockedUntil = now + LOCK_MS;
       state.hits = [];
       await this.ctx.storage.put(stateKey, state);
-      return json({ ok: false, error: 'rate_limited', retryAfterMs: LOCK_MS, totalAttempts: state.total }, 429, {
-        'Retry-After': String(Math.ceil(LOCK_MS / 1000))
-      });
+      return json({ ok: false, error: 'rate_limited', retryAfterMs: LOCK_MS, totalAttempts: state.total }, 429, { 'Retry-After': String(Math.ceil(LOCK_MS / 1000)) });
     }
 
     let body = {};
@@ -406,11 +420,9 @@ export class LoginLimiter {
 
     let valid = false;
     let successMessage = '';
-
     if (mode === 'password') {
       const username = String(body?.username ?? '').trim().toLowerCase();
-      const password = String(body?.password ?? '');
-      const passwordHash = await sha256(password);
+      const passwordHash = await sha256(String(body?.password ?? ''));
       valid = username === LAB_USER && passwordHash === LAB_PASSWORD_SHA256;
       successMessage = 'Login fictício autorizado';
     } else {
@@ -427,26 +439,19 @@ export class LoginLimiter {
     }
 
     await this.ctx.storage.put(stateKey, state);
-    return json({
-      ok: false,
-      error: mode === 'password' ? 'invalid_credentials' : 'invalid_pin',
-      remaining: Math.max(0, MAX_ATTEMPTS - state.hits.length),
-      totalAttempts: state.total
-    }, 401);
+    return json({ ok: false, error: mode === 'password' ? 'invalid_credentials' : 'invalid_pin', remaining: Math.max(0, MAX_ATTEMPTS - state.hits.length), totalAttempts: state.total }, 401);
   }
 }
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-
     if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
 
     if (url.pathname === '/url-provider-detect') {
       if (request.method !== 'POST') return json({ ok: false, error: 'method_not_allowed' }, 405);
       return handleProviderDetect(request);
     }
-
     if (url.pathname === '/url-auth-test') {
       if (request.method !== 'POST') return json({ ok: false, error: 'method_not_allowed' }, 405);
       return handleUrlAuthTest(request);
@@ -460,17 +465,10 @@ export default {
     if (request.method !== 'POST') return json({ ok: false, error: 'method_not_allowed' }, 405);
 
     let body = {};
-    if (isVulnerableLogin) {
-      try { body = await request.clone().json(); } catch {}
-    }
-
+    if (isVulnerableLogin) { try { body = await request.clone().json(); } catch {} }
     const ip = request.headers.get('CF-Connecting-IP') || 'lab-client';
-    const clientKey = isVulnerableLogin
-      ? `vuln:${String(body?.labClientId || 'client-a').slice(0, 64)}`
-      : `secure:${ip}`;
-
+    const clientKey = isVulnerableLogin ? `vuln:${String(body?.labClientId || 'client-a').slice(0, 64)}` : `secure:${ip}`;
     const id = env.LOGIN_LIMITER.idFromName(clientKey);
-    const stub = env.LOGIN_LIMITER.get(id);
-    return stub.fetch(request);
+    return env.LOGIN_LIMITER.get(id).fetch(request);
   }
 };
