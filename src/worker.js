@@ -32,16 +32,31 @@ function normalizeTarget(raw) {
   return url;
 }
 
-function isAuthorizedLabHost(hostname) {
-  const host = String(hostname || '').toLowerCase();
-  return host === 'wallissonghost-code.github.io' || host === 'limpo.wallissonghost.workers.dev';
+function isPublicHostname(hostname) {
+  const host = String(hostname || '').trim().toLowerCase().replace(/\.$/, '');
+  if (!host || host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local') || host.endsWith('.internal')) return false;
+  if (host === '0.0.0.0' || host === '::1' || host === '[::1]') return false;
+  if (/^127\./.test(host) || /^10\./.test(host) || /^192\.168\./.test(host)) return false;
+  const m = host.match(/^172\.(\d+)\./);
+  if (m && Number(m[1]) >= 16 && Number(m[1]) <= 31) return false;
+  if (/^169\.254\./.test(host)) return false;
+  return true;
+}
+
+function validateAuthorizedTarget(raw, authorized) {
+  const target = normalizeTarget(raw);
+  if (!authorized) return { error: json({ ok: false, error: 'authorization_required', classification: 'indeterminate' }, 400) };
+  if (!target || !isPublicHostname(target.hostname)) {
+    return { error: json({ ok: false, error: 'target_not_allowed', classification: 'indeterminate', message: 'Use apenas uma URL HTTPS pública que você tenha autorização para testar.' }, 403) };
+  }
+  return { target };
 }
 
 function extractFirebaseConfig(text) {
   const source = String(text || '');
-  const apiKey = source.match(/apiKey\s*:\s*["'`]([^"'`]+)["'`]/)?.[1] || '';
-  const authDomain = source.match(/authDomain\s*:\s*["'`]([^"'`]+)["'`]/)?.[1] || '';
-  const projectId = source.match(/projectId\s*:\s*["'`]([^"'`]+)["'`]/)?.[1] || '';
+  const apiKey = source.match(/apiKey\s*[:=]\s*["'`]([^"'`]+)["'`]/i)?.[1] || '';
+  const authDomain = source.match(/authDomain\s*[:=]\s*["'`]([^"'`]+)["'`]/i)?.[1] || '';
+  const projectId = source.match(/projectId\s*[:=]\s*["'`]([^"'`]+)["'`]/i)?.[1] || '';
   return { apiKey, authDomain, projectId };
 }
 
@@ -57,7 +72,7 @@ function extractModuleUrls(text, baseUrl) {
     while ((match = pattern.exec(source))) {
       try {
         const u = new URL(match[1], baseUrl);
-        if (u.origin === baseUrl.origin && /^https:$/.test(u.protocol)) found.add(u.href);
+        if (u.origin === baseUrl.origin && u.protocol === 'https:' && isPublicHostname(u.hostname)) found.add(u.href);
       } catch {}
     }
   }
@@ -67,20 +82,47 @@ function extractModuleUrls(text, baseUrl) {
 async function readTextLimited(url) {
   const response = await fetch(url, {
     redirect: 'follow',
-    headers: { 'User-Agent': 'LIMPO-Authorized-Auth-Test/1.0' }
+    headers: { 'User-Agent': 'LIMPO-Authorized-Auth-Audit/2.0' }
   });
   if (!response.ok) throw new Error(`target_http_${response.status}`);
+  const finalUrl = new URL(response.url || url.href || String(url));
+  if (!isPublicHostname(finalUrl.hostname) || finalUrl.protocol !== 'https:') throw new Error('unsafe_redirect');
   const length = Number(response.headers.get('content-length') || 0);
   if (length > 1_500_000) throw new Error('target_too_large');
-  return (await response.text()).slice(0, 1_500_000);
+  return { text: (await response.text()).slice(0, 1_500_000), finalUrl };
 }
 
-async function discoverFirebase(target) {
-  const first = await readTextLimited(target);
-  let config = extractFirebaseConfig(first);
-  if (config.apiKey) return config;
+function providerSignals(text) {
+  const s = String(text || '');
+  const low = s.toLowerCase();
+  const hits = [];
+  const add = (provider, evidence) => hits.push({ provider, evidence });
 
-  const queue = extractModuleUrls(first, target).slice(0, 12).map(href => ({ href, depth: 0 }));
+  if (/firebase\/auth|firebase-auth|identitytoolkit\.googleapis\.com|authdomain\s*[:=]|initializeapp\s*\(/i.test(s)) add('firebase', 'Firebase Auth / Identity Toolkit');
+  if (/\.supabase\.co|supabase-js|createclient\s*\(/i.test(s) && /supabase/i.test(s)) add('supabase', 'Supabase client/auth');
+  if (/auth0\.com|@auth0|createauth0client|auth0client/i.test(s)) add('auth0', 'Auth0 SDK/domain');
+  if (/cognito-idp|amazoncognito|cognitouserpool|aws-amplify\/auth|userpoolid/i.test(s)) add('cognito', 'Amazon Cognito / Amplify Auth');
+  if (/clerk\.com|@clerk|clerkpublishablekey|clerk-js/i.test(s)) add('clerk', 'Clerk SDK/domain');
+  if (/accounts\.google\.com\/gsi|google\.accounts\.id|google-signin-client_id/i.test(s)) add('google-identity', 'Google Identity Services');
+  if (/next-auth|nextauth|\/api\/auth\/(signin|session)|authjs/i.test(s)) add('authjs', 'Auth.js / NextAuth');
+  if (/wordpress|wp-login\.php|wp-json/i.test(low)) add('wordpress', 'WordPress');
+  return hits;
+}
+
+function chooseProvider(allSignals, firebaseConfig) {
+  if (firebaseConfig?.apiKey) return { provider: 'firebase', confidence: 'high', adapter: 'firebase-password' };
+  const order = ['supabase', 'auth0', 'cognito', 'clerk', 'google-identity', 'authjs', 'wordpress'];
+  for (const provider of order) {
+    if (allSignals.some(x => x.provider === provider)) return { provider, confidence: 'medium', adapter: 'detection-only' };
+  }
+  return { provider: 'custom-or-unknown', confidence: 'low', adapter: 'detection-only' };
+}
+
+async function discoverAuth(target) {
+  const first = await readTextLimited(target);
+  let firebaseConfig = extractFirebaseConfig(first.text);
+  const signals = providerSignals(first.text);
+  const queue = extractModuleUrls(first.text, first.finalUrl).slice(0, 12).map(href => ({ href, depth: 0 }));
   const visited = new Set();
 
   while (queue.length && visited.size < 20) {
@@ -89,19 +131,28 @@ async function discoverFirebase(target) {
     visited.add(item.href);
     try {
       const moduleUrl = new URL(item.href);
-      if (!isAuthorizedLabHost(moduleUrl.hostname)) continue;
-      const text = await readTextLimited(moduleUrl);
-      config = extractFirebaseConfig(text);
-      if (config.apiKey) return config;
+      if (moduleUrl.origin !== first.finalUrl.origin || !isPublicHostname(moduleUrl.hostname)) continue;
+      const loaded = await readTextLimited(moduleUrl);
+      const cfg = extractFirebaseConfig(loaded.text);
+      if (!firebaseConfig.apiKey && cfg.apiKey) firebaseConfig = cfg;
+      signals.push(...providerSignals(loaded.text));
       if (item.depth < 2) {
-        for (const href of extractModuleUrls(text, moduleUrl).slice(0, 10)) {
+        for (const href of extractModuleUrls(loaded.text, loaded.finalUrl).slice(0, 10)) {
           if (!visited.has(href)) queue.push({ href, depth: item.depth + 1 });
         }
       }
     } catch {}
   }
 
-  return config;
+  const chosen = chooseProvider(signals, firebaseConfig);
+  const evidence = [...new Set(signals.filter(x => chosen.provider === 'custom-or-unknown' || x.provider === chosen.provider).map(x => x.evidence))].slice(0, 5);
+  return {
+    ...chosen,
+    evidence,
+    firebaseConfig,
+    scannedScripts: visited.size,
+    finalOrigin: first.finalUrl.origin
+  };
 }
 
 function classifyFirebaseError(code) {
@@ -111,35 +162,65 @@ function classifyFirebaseError(code) {
   return 'indeterminate';
 }
 
+async function handleProviderDetect(request) {
+  let body = {};
+  try { body = await request.json(); } catch {}
+  const checked = validateAuthorizedTarget(body?.url, body?.authorized === true);
+  if (checked.error) return checked.error;
+  const started = Date.now();
+  try {
+    const discovery = await discoverAuth(checked.target);
+    return json({
+      ok: true,
+      provider: discovery.provider,
+      confidence: discovery.confidence,
+      adapter: discovery.adapter,
+      evidence: discovery.evidence,
+      scannedScripts: discovery.scannedScripts,
+      finalOrigin: discovery.finalOrigin,
+      latencyMs: Date.now() - started
+    });
+  } catch (error) {
+    return json({ ok: false, error: 'target_unreachable', classification: 'indeterminate', detail: String(error?.message || 'fetch_failed'), latencyMs: Date.now() - started }, 502);
+  }
+}
+
 async function handleUrlAuthTest(request) {
   let body = {};
   try { body = await request.json(); } catch {}
 
-  const target = normalizeTarget(body?.url);
+  const checked = validateAuthorizedTarget(body?.url, body?.authorized === true);
+  if (checked.error) return checked.error;
+  const target = checked.target;
   const email = String(body?.email || '').trim();
   const password = String(body?.password || '');
-  const authorized = body?.authorized === true;
 
-  if (!authorized) return json({ ok: false, error: 'authorization_required', classification: 'indeterminate' }, 400);
-  if (!target || !isAuthorizedLabHost(target.hostname)) {
-    return json({ ok: false, error: 'target_not_allowed', classification: 'indeterminate', message: 'Este modo aceita apenas os domínios autorizados do laboratório.' }, 403);
-  }
   if (!email || !password || email.length > 254 || password.length > 256) {
     return json({ ok: false, error: 'invalid_input', classification: 'indeterminate' }, 400);
   }
 
   const started = Date.now();
-  let config;
+  let discovery;
   try {
-    config = await discoverFirebase(target);
+    discovery = await discoverAuth(target);
   } catch (error) {
     return json({ ok: false, error: 'target_unreachable', classification: 'indeterminate', detail: String(error?.message || 'fetch_failed') }, 502);
   }
 
-  if (!config?.apiKey) {
-    return json({ ok: false, error: 'firebase_not_detected', classification: 'indeterminate', authType: 'unknown', latencyMs: Date.now() - started }, 422);
+  if (discovery.provider !== 'firebase' || !discovery.firebaseConfig?.apiKey) {
+    return json({
+      ok: false,
+      error: 'adapter_not_available',
+      classification: 'indeterminate',
+      provider: discovery.provider,
+      confidence: discovery.confidence,
+      authType: discovery.adapter,
+      latencyMs: Date.now() - started,
+      message: 'Provedor detectado, mas o LIMPO ainda não possui adaptador ativo para testar credencial/rate limit deste fluxo.'
+    }, 422);
   }
 
+  const config = discovery.firebaseConfig;
   const endpoint = `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${encodeURIComponent(config.apiKey)}`;
   let authResponse;
   let data;
@@ -150,21 +231,20 @@ async function handleUrlAuthTest(request) {
       body: JSON.stringify({ email, password, returnSecureToken: true })
     });
     data = await authResponse.json().catch(() => ({}));
-  } catch (error) {
-    return json({ ok: false, authenticated: false, classification: 'indeterminate', authType: 'firebase-password', error: 'provider_unreachable', latencyMs: Date.now() - started }, 502);
+  } catch {
+    return json({ ok: false, authenticated: false, classification: 'indeterminate', provider: 'firebase', authType: 'firebase-password', error: 'provider_unreachable', latencyMs: Date.now() - started }, 502);
   }
 
   const latencyMs = Date.now() - started;
-
   if (authResponse.ok && data?.localId) {
     return json({
       ok: true,
       authenticated: true,
       classification: 'authenticated',
+      provider: 'firebase',
       authType: 'firebase-password',
       projectId: config.projectId || null,
       authDomain: config.authDomain || null,
-      email: data.email || email,
       providerHttpStatus: authResponse.status,
       latencyMs
     });
@@ -173,17 +253,20 @@ async function handleUrlAuthTest(request) {
   const firebaseCode = String(data?.error?.message || 'AUTH_FAILED');
   const classification = classifyFirebaseError(firebaseCode);
   const status = classification === 'blocked' ? 429 : classification === 'invalid' ? 401 : 422;
+  const retryAfter = authResponse.headers.get('retry-after');
 
   return json({
     ok: false,
     authenticated: false,
     classification,
+    provider: 'firebase',
     authType: 'firebase-password',
     projectId: config.projectId || null,
     authDomain: config.authDomain || null,
     error: classification === 'blocked' ? 'rate_limited' : classification === 'invalid' ? 'invalid_credentials' : 'indeterminate_auth_result',
     providerCode: firebaseCode,
     providerHttpStatus: authResponse.status,
+    retryAfter: retryAfter || null,
     latencyMs
   }, status);
 }
@@ -260,6 +343,11 @@ export default {
     const url = new URL(request.url);
 
     if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
+
+    if (url.pathname === '/url-provider-detect') {
+      if (request.method !== 'POST') return json({ ok: false, error: 'method_not_allowed' }, 405);
+      return handleProviderDetect(request);
+    }
 
     if (url.pathname === '/url-auth-test') {
       if (request.method !== 'POST') return json({ ok: false, error: 'method_not_allowed' }, 405);
