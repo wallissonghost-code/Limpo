@@ -52,14 +52,16 @@
     </section>
 
     <section id="urlView" class="view">
-      <div class="autoTitle">🌐 TESTE POR URL — UMA CREDENCIAL POR VEZ</div>
+      <div class="autoTitle">🌐 TESTE POR URL — CREDENCIAL E BLOQUEIO</div>
       <div class="privacy"><b>URL, e-mail e senha não ficam gravados no GitHub.</b> Você cola/digita na hora. O painel não usa localStorage para esses campos e limpa a senha depois do teste. O backend não devolve token de sessão.</div>
       <div class="row"><div class="urlfull"><label>URL do site</label><input id="targetUrl" inputmode="url" autocomplete="off" placeholder="https://.../"></div></div>
       <div class="row"><div><label>E-mail</label><input id="targetEmail" type="email" autocomplete="off" placeholder="seu@email.com"></div><div><label>Senha</label><input id="targetPassword" type="password" autocomplete="off" placeholder="Digite somente na hora do teste"></div></div>
       <div><label>Confirmação</label><select id="targetAuthorized"><option value="">Selecione...</option><option value="yes">Tenho autorização para testar este site</option></select></div>
-      <div class="buttons"><button id="urlTestBtn" class="primary">▶ TESTAR CREDENCIAL</button><button id="urlClearBtn" class="secondary">■ LIMPAR</button></div>
-      <div class="stats"><div class="card"><small>Status</small><b id="urlStatus">AGUARDANDO</b></div><div class="card"><small>Autenticação</small><b id="urlAuth">---</b></div><div class="card"><small>Latência</small><b id="urlLatency" class="green">0 ms</b></div></div>
-      <div id="urlTerminal" class="terminal"><div class="green">Cole a URL manualmente. Este modo não executa lista de senhas nem testes automáticos.</div></div>
+      <div class="buttons"><button id="urlTestBtn" class="primary">▶ TESTAR CREDENCIAL</button><button id="urlBlockBtn" class="danger">⚠ TESTAR BLOQUEIO</button><button id="urlClearBtn" class="secondary">■ LIMPAR</button></div>
+      <div class="note">O teste de bloqueio usa uma senha propositalmente inválida, no máximo 8 tentativas, com intervalo curto e para imediatamente se detectar HTTP 429/rate limit. Ele não tenta descobrir sua senha.</div>
+      <div class="stats"><div class="card"><small>Status do login</small><b id="urlStatus">AGUARDANDO</b></div><div class="card"><small>Autenticação</small><b id="urlAuth">---</b></div><div class="card"><small>Latência</small><b id="urlLatency" class="green">0 ms</b></div></div>
+      <div class="stats"><div class="card"><small>Teste de bloqueio</small><b id="blockStatus">PARADO</b></div><div class="card"><small>Tentativas</small><b id="blockAttempts">0</b></div><div class="card"><small>Resultado</small><b id="blockResult">---</b></div></div>
+      <div id="urlTerminal" class="terminal"><div class="green">Cole a URL manualmente. O teste automático de bloqueio é limitado e não usa lista de senhas.</div></div>
     </section>
   </div>
 </div>
@@ -98,13 +100,38 @@ $('#urlTestBtn').onclick=async()=>{
     const r=await fetch('/url-auth-test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url,email,password,authorized:true})});
     const data=await r.json().catch(()=>({}));const ms=Number(data.latencyMs)||Math.round(performance.now()-t);
     $('#urlLatency').textContent=ms+' ms';$('#urlAuth').textContent=data.authType||'---';
-    $('#urlStatus').textContent=data.authenticated?'AUTORIZADO':r.status===429?'BLOQUEADO':r.status===403?'ALVO NÃO PERMITIDO':'NEGADO';
+    $('#urlStatus').textContent=data.authenticated?'LOGIN AUTENTICADO':r.status===429?'BLOQUEADO':r.status===403?'ALVO NÃO PERMITIDO':'CREDENCIAL INVÁLIDA';
     const safe={status:r.status,authenticated:!!data.authenticated,authType:data.authType||null,projectId:data.projectId||null,error:data.error||null,providerCode:data.providerCode||null};
     addLine($('#urlTerminal'),'Teste único → '+JSON.stringify(safe),data.authenticated?'green':r.status===429?'warn':'bad');
   }catch(e){$('#urlStatus').textContent='ERRO';$('#urlAuth').textContent='---';addLine($('#urlTerminal'),'Falha: '+e.message,'bad')}
   finally{$('#targetPassword').value='';btn.disabled=false}
 };
-$('#urlClearBtn').onclick=()=>{$('#targetUrl').value='';$('#targetEmail').value='';$('#targetPassword').value='';$('#targetAuthorized').value='';$('#urlStatus').textContent='AGUARDANDO';$('#urlAuth').textContent='---';$('#urlLatency').textContent='0 ms';$('#urlTerminal').innerHTML='<div class="green">Campos limpos. Nada foi salvo no navegador.</div>'};
+
+let blockRunning=false;
+$('#urlBlockBtn').onclick=async()=>{
+  if(blockRunning)return;
+  const url=$('#targetUrl').value.trim(),email=$('#targetEmail').value.trim(),authorized=$('#targetAuthorized').value==='yes';
+  if(!url||!email){addLine($('#urlTerminal'),'Para testar bloqueio, preencha URL e e-mail.','warn');return}
+  if(!authorized){addLine($('#urlTerminal'),'Confirme que você tem autorização para testar o site.','warn');return}
+  blockRunning=true;$('#urlBlockBtn').disabled=true;$('#blockStatus').textContent='TESTANDO';$('#blockAttempts').textContent='0';$('#blockResult').textContent='AGUARDANDO';
+  const wrongPassword='LIMPO_INVALID_'+Date.now()+'_DO_NOT_USE';
+  let blocked=false;
+  for(let i=1;i<=8&&blockRunning;i++){
+    try{
+      const r=await fetch('/url-auth-test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url,email,password:wrongPassword,authorized:true})});
+      const data=await r.json().catch(()=>({}));$('#blockAttempts').textContent=String(i);
+      const safe={attempt:i,status:r.status,error:data.error||null,providerCode:data.providerCode||null};
+      addLine($('#urlTerminal'),'Bloqueio #'+i+' → '+JSON.stringify(safe),r.status===429?'warn':'bad');
+      if(r.status===429||data.error==='rate_limited'){blocked=true;$('#blockStatus').textContent='BLOQUEADO';$('#blockResult').textContent='PROTEÇÃO DETECTADA';break}
+      if(r.status!==401){$('#blockStatus').textContent='INTERROMPIDO';$('#blockResult').textContent='RESPOSTA '+r.status;break}
+      if(i<8)await sleep(800);
+    }catch(e){$('#blockStatus').textContent='ERRO';$('#blockResult').textContent='FALHA DE REDE';addLine($('#urlTerminal'),'Teste de bloqueio falhou: '+e.message,'bad');break}
+  }
+  if(!blocked&&$('#blockStatus').textContent==='TESTANDO'){ $('#blockStatus').textContent='CONCLUÍDO';$('#blockResult').textContent='SEM 429 EM 8 TENTATIVAS'; }
+  blockRunning=false;$('#urlBlockBtn').disabled=false;
+};
+
+$('#urlClearBtn').onclick=()=>{blockRunning=false;$('#targetUrl').value='';$('#targetEmail').value='';$('#targetPassword').value='';$('#targetAuthorized').value='';$('#urlStatus').textContent='AGUARDANDO';$('#urlAuth').textContent='---';$('#urlLatency').textContent='0 ms';$('#blockStatus').textContent='PARADO';$('#blockAttempts').textContent='0';$('#blockResult').textContent='---';$('#urlTerminal').innerHTML='<div class="green">Campos limpos. Nada foi salvo no navegador.</div>'};
 </script>
 </body>
 </html>
