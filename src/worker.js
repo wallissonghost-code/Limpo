@@ -82,7 +82,7 @@ function extractModuleUrls(text, baseUrl) {
 async function readTextLimited(url) {
   const response = await fetch(url, {
     redirect: 'follow',
-    headers: { 'User-Agent': 'LIMPO-Authorized-Auth-Audit/2.1' }
+    headers: { 'User-Agent': 'LIMPO-Authorized-Auth-Audit/2.2' }
   });
   if (!response.ok) throw new Error(`target_http_${response.status}`);
   const finalUrl = new URL(response.url || url.href || String(url));
@@ -97,44 +97,69 @@ function extractCustomAuthHints(text, baseUrl) {
   const hints = [];
   const endpoints = new Set();
   const fields = new Set();
+  const methods = new Set();
+
+  const addEndpoint = raw => {
+    const value = String(raw || '').trim();
+    if (!value) return;
+    try {
+      const u = new URL(value, baseUrl);
+      if (u.protocol === 'https:' && isPublicHostname(u.hostname)) endpoints.add(u.href);
+    } catch {
+      if (value.startsWith('/')) endpoints.add(value);
+    }
+  };
+
+  const axiosPattern = /axios\.(post|put|patch|get)\s*\(\s*["'`]([^"'`]*(?:login|signin|sign-in|auth|session|token)[^"'`]*)["'`]/gi;
+  let m;
+  while ((m = axiosPattern.exec(s)) && endpoints.size < 12) {
+    methods.add(String(m[1]).toUpperCase());
+    addEndpoint(m[2]);
+  }
+
+  const fetchPattern = /fetch\s*\(\s*["'`]([^"'`]*(?:login|signin|sign-in|auth|session|token)[^"'`]*)["'`]\s*(?:,\s*\{([\s\S]{0,500}?)\})?/gi;
+  while ((m = fetchPattern.exec(s)) && endpoints.size < 12) {
+    addEndpoint(m[1]);
+    const opts = String(m[2] || '');
+    const method = opts.match(/method\s*:\s*["'`](POST|PUT|PATCH|GET)["'`]/i)?.[1];
+    methods.add(String(method || 'GET').toUpperCase());
+  }
 
   const endpointPatterns = [
-    /fetch\s*\(\s*["'`]([^"'`]*(?:login|signin|sign-in|auth|session|token)[^"'`]*)["'`]/gi,
-    /axios\.(?:post|put)\s*\(\s*["'`]([^"'`]*(?:login|signin|sign-in|auth|session|token)[^"'`]*)["'`]/gi,
-    /(?:url|endpoint|baseURL)\s*[:=]\s*["'`]([^"'`]*(?:login|signin|sign-in|auth|session|token)[^"'`]*)["'`]/gi,
-    /["'`]((?:\/|https:\/\/)[^"'`]{0,140}\/(?:api\/)?(?:auth\/)?(?:login|signin|sign-in|session|token)[^"'`]*)["'`]/gi
+    /(?:url|endpoint|baseURL|apiUrl|apiURL)\s*[:=]\s*["'`]([^"'`]*(?:login|signin|sign-in|auth|session|token)[^"'`]*)["'`]/gi,
+    /["'`]((?:\/|https:\/\/)[^"'`]{0,160}\/(?:api\/)?(?:auth\/)?(?:login|signin|sign-in|session|token)[^"'`]*)["'`]/gi
   ];
-
   for (const pattern of endpointPatterns) {
-    let m;
-    while ((m = pattern.exec(s)) && endpoints.size < 12) {
-      try {
-        const u = new URL(m[1], baseUrl);
-        if (u.protocol === 'https:' && isPublicHostname(u.hostname)) endpoints.add(u.href);
-      } catch {
-        if (String(m[1]).startsWith('/')) endpoints.add(String(m[1]));
-      }
-    }
+    while ((m = pattern.exec(s)) && endpoints.size < 12) addEndpoint(m[1]);
   }
+
+  const genericMethodPattern = /\bmethod\s*:\s*["'`](POST|PUT|PATCH|GET)["'`]/gi;
+  while ((m = genericMethodPattern.exec(s)) && methods.size < 6) methods.add(String(m[1]).toUpperCase());
+  if (/mutation\s+[A-Za-z0-9_]*(?:login|signin|auth)/i.test(s)) methods.add('POST (GraphQL)');
 
   const fieldPatterns = [
     /\b(email|username|user|login|identifier)\b\s*[:=]/gi,
     /\b(password|senha|pass)\b\s*[:=]/gi
   ];
   for (const pattern of fieldPatterns) {
-    let m;
     while ((m = pattern.exec(s)) && fields.size < 8) fields.add(String(m[1]).toLowerCase());
   }
 
   const hasCredentialFields = [...fields].some(x => ['email','username','user','login','identifier'].includes(x)) &&
     [...fields].some(x => ['password','senha','pass'].includes(x));
-  const hasSubmitCode = /fetch\s*\(|axios\.(?:post|put)\s*\(|XMLHttpRequest|graphql|mutation\s+[A-Za-z0-9_]*(?:login|signin|auth)/i.test(s);
+  const hasSubmitCode = /fetch\s*\(|axios\.(?:post|put|patch)\s*\(|XMLHttpRequest|graphql|mutation\s+[A-Za-z0-9_]*(?:login|signin|auth)/i.test(s);
 
-  if (endpoints.size) hints.push({ provider: 'custom-api', evidence: `Fluxo de login customizado; endpoint(s): ${[...endpoints].slice(0, 3).join(', ')}` });
+  if (endpoints.size) hints.push({ provider: 'custom-api', evidence: `Endpoint(s) de autenticação: ${[...endpoints].slice(0, 3).join(', ')}` });
+  if (methods.size) hints.push({ provider: 'custom-api', evidence: `Método(s) observado(s): ${[...methods].join(', ')}` });
   if (hasCredentialFields) hints.push({ provider: 'custom-api', evidence: `Campos de credencial detectados: ${[...fields].join(', ')}` });
   if (hasSubmitCode) hints.push({ provider: 'custom-api', evidence: 'Código cliente envia autenticação por API/GraphQL/XHR' });
 
-  return { hints, endpoints: [...endpoints].slice(0, 8), fields: [...fields].slice(0, 8) };
+  return {
+    hints,
+    endpoints: [...endpoints].slice(0, 8),
+    fields: [...fields].slice(0, 8),
+    methods: [...methods].slice(0, 6)
+  };
 }
 
 function providerSignals(text, baseUrl) {
@@ -164,6 +189,7 @@ function chooseProvider(allSignals, firebaseConfig) {
     if (allSignals.some(x => x.provider === provider)) return { provider, confidence: 'medium', adapter: 'detection-only' };
   }
   const customCount = allSignals.filter(x => x.provider === 'custom-api').length;
+  if (customCount >= 3) return { provider: 'custom-api', confidence: 'high', adapter: 'detection-only' };
   if (customCount >= 2) return { provider: 'custom-api', confidence: 'medium', adapter: 'detection-only' };
   if (customCount === 1) return { provider: 'custom-api', confidence: 'low', adapter: 'detection-only' };
   return { provider: 'custom-or-unknown', confidence: 'low', adapter: 'detection-only' };
@@ -176,6 +202,7 @@ async function discoverAuth(target) {
   const signals = [...firstSignals.hits];
   const customEndpoints = new Set(firstSignals.custom.endpoints);
   const customFields = new Set(firstSignals.custom.fields);
+  const customMethods = new Set(firstSignals.custom.methods);
   const queue = extractModuleUrls(first.text, first.finalUrl).slice(0, 12).map(href => ({ href, depth: 0 }));
   const visited = new Set();
 
@@ -193,6 +220,7 @@ async function discoverAuth(target) {
       signals.push(...found.hits);
       found.custom.endpoints.forEach(x => customEndpoints.add(x));
       found.custom.fields.forEach(x => customFields.add(x));
+      found.custom.methods.forEach(x => customMethods.add(x));
       if (item.depth < 2) {
         for (const href of extractModuleUrls(loaded.text, loaded.finalUrl).slice(0, 10)) {
           if (!visited.has(href)) queue.push({ href, depth: item.depth + 1 });
@@ -204,7 +232,7 @@ async function discoverAuth(target) {
   const chosen = chooseProvider(signals, firebaseConfig);
   const evidence = [...new Set(signals
     .filter(x => chosen.provider === 'custom-or-unknown' || x.provider === chosen.provider)
-    .map(x => x.evidence))].slice(0, 8);
+    .map(x => x.evidence))].slice(0, 10);
 
   return {
     ...chosen,
@@ -212,7 +240,8 @@ async function discoverAuth(target) {
     firebaseConfig,
     customAuth: {
       endpoints: [...customEndpoints].slice(0, 8),
-      fields: [...customFields].slice(0, 8)
+      fields: [...customFields].slice(0, 8),
+      methods: [...customMethods].slice(0, 6)
     },
     scannedScripts: visited.size,
     finalOrigin: first.finalUrl.origin
