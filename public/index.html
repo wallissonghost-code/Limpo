@@ -58,8 +58,8 @@
       <div class="row"><div><label>E-mail</label><input id="targetEmail" type="email" autocomplete="off" placeholder="seu@email.com"></div><div><label>Senha</label><input id="targetPassword" type="password" autocomplete="off" placeholder="Digite somente na hora do teste"></div></div>
       <div><label>Confirmação</label><select id="targetAuthorized"><option value="">Selecione...</option><option value="yes">Tenho autorização para testar este site</option></select></div>
       <div class="buttons"><button id="urlTestBtn" class="primary">▶ TESTAR CREDENCIAL</button><button id="urlBlockBtn" class="danger">⚠ TESTAR BLOQUEIO</button><button id="urlClearBtn" class="secondary">■ LIMPAR</button></div>
-      <div class="note">O teste de bloqueio usa uma senha propositalmente inválida, no máximo 8 tentativas, com intervalo curto e para imediatamente se detectar HTTP 429/rate limit. Ele não tenta descobrir sua senha.</div>
-      <div class="stats"><div class="card"><small>Status do login</small><b id="urlStatus">AGUARDANDO</b></div><div class="card"><small>Autenticação</small><b id="urlAuth">---</b></div><div class="card"><small>Latência</small><b id="urlLatency" class="green">0 ms</b></div></div>
+      <div class="note">Resultados agora são separados em <b>AUTENTICADA</b>, <b>INVÁLIDA</b>, <b>BLOQUEADA</b> e <b>INDETERMINADA</b>. Uma tentativa feita durante bloqueio ou erro do provedor nunca é marcada como senha errada.</div>
+      <div class="stats"><div class="card"><small>Classificação</small><b id="urlStatus">AGUARDANDO</b></div><div class="card"><small>Autenticação</small><b id="urlAuth">---</b></div><div class="card"><small>Latência</small><b id="urlLatency" class="green">0 ms</b></div></div>
       <div class="stats"><div class="card"><small>Teste de bloqueio</small><b id="blockStatus">PARADO</b></div><div class="card"><small>Tentativas</small><b id="blockAttempts">0</b></div><div class="card"><small>Resultado</small><b id="blockResult">---</b></div></div>
       <div id="urlTerminal" class="terminal"><div class="green">Cole a URL manualmente. O teste automático de bloqueio é limitado e não usa lista de senhas.</div></div>
     </section>
@@ -90,6 +90,14 @@ $('#rotateId').onclick=()=>{$('#clientId').value='client-'+Math.random().toStrin
 $('#demoSend').onclick=async()=>{const vuln=$('#demoMode').value==='vuln',url=vuln?'/lab/vulnerable/login':'/auth/login',payload={username:$('#demoUser').value,password:$('#demoPass').value};if(vuln)payload.labClientId=$('#clientId').value;try{const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}),data=await r.json().catch(()=>({}));demoCount++;$('#demoCount').textContent=demoCount;$('#demoHttp').textContent=r.status;$('#demoStatus').textContent=r.ok?'AUTORIZADO':r.status===429?'BLOQUEADO':'NEGADO';addLine($('#demoTerminal'),(vuln?'VULN':'SAFE')+' '+url+' → '+r.status+' | id='+$('#clientId').value+' | '+JSON.stringify(data),r.ok?'green':r.status===429?'warn':'bad')}catch(e){$('#demoStatus').textContent='ERRO';addLine($('#demoTerminal'),'Falha de rede: '+e.message,'bad')}};
 $('#demoClear').onclick=()=>{demoCount=0;$('#demoCount').textContent='0';$('#demoHttp').textContent='---';$('#demoStatus').textContent='AGUARDANDO';$('#demoTerminal').innerHTML='<div class="green">Demo limpa.</div>'};
 
+function urlClassification(data,status){
+  if(data?.classification==='authenticated'||data?.authenticated)return 'AUTENTICADA';
+  if(data?.classification==='blocked'||status===429)return 'BLOQUEADA';
+  if(data?.classification==='invalid'||status===401)return 'INVÁLIDA';
+  if(status===403)return 'ALVO NÃO PERMITIDO';
+  return 'INDETERMINADA';
+}
+
 $('#urlTestBtn').onclick=async()=>{
   const url=$('#targetUrl').value.trim(),email=$('#targetEmail').value.trim(),password=$('#targetPassword').value,authorized=$('#targetAuthorized').value==='yes';
   if(!url||!email||!password){addLine($('#urlTerminal'),'Preencha URL, e-mail e senha.','warn');return}
@@ -98,12 +106,11 @@ $('#urlTestBtn').onclick=async()=>{
   const t=performance.now();
   try{
     const r=await fetch('/url-auth-test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url,email,password,authorized:true})});
-    const data=await r.json().catch(()=>({}));const ms=Number(data.latencyMs)||Math.round(performance.now()-t);
-    $('#urlLatency').textContent=ms+' ms';$('#urlAuth').textContent=data.authType||'---';
-    $('#urlStatus').textContent=data.authenticated?'LOGIN AUTENTICADO':r.status===429?'BLOQUEADO':r.status===403?'ALVO NÃO PERMITIDO':'CREDENCIAL INVÁLIDA';
-    const safe={status:r.status,authenticated:!!data.authenticated,authType:data.authType||null,projectId:data.projectId||null,error:data.error||null,providerCode:data.providerCode||null};
-    addLine($('#urlTerminal'),'Teste único → '+JSON.stringify(safe),data.authenticated?'green':r.status===429?'warn':'bad');
-  }catch(e){$('#urlStatus').textContent='ERRO';$('#urlAuth').textContent='---';addLine($('#urlTerminal'),'Falha: '+e.message,'bad')}
+    const data=await r.json().catch(()=>({}));const ms=Number(data.latencyMs)||Math.round(performance.now()-t),classification=urlClassification(data,r.status);
+    $('#urlLatency').textContent=ms+' ms';$('#urlAuth').textContent=data.authType||'---';$('#urlStatus').textContent=classification;
+    const safe={status:r.status,classification,authenticated:!!data.authenticated,authType:data.authType||null,projectId:data.projectId||null,error:data.error||null,providerCode:data.providerCode||null,providerHttpStatus:data.providerHttpStatus||null};
+    addLine($('#urlTerminal'),'Teste único → '+JSON.stringify(safe),classification==='AUTENTICADA'?'green':classification==='BLOQUEADA'||classification==='INDETERMINADA'?'warn':'bad');
+  }catch(e){$('#urlStatus').textContent='INDETERMINADA';$('#urlAuth').textContent='---';addLine($('#urlTerminal'),'Falha de rede; validade da credencial não determinada: '+e.message,'warn')}
   finally{$('#targetPassword').value='';btn.disabled=false}
 };
 
@@ -115,19 +122,20 @@ $('#urlBlockBtn').onclick=async()=>{
   if(!authorized){addLine($('#urlTerminal'),'Confirme que você tem autorização para testar o site.','warn');return}
   blockRunning=true;$('#urlBlockBtn').disabled=true;$('#blockStatus').textContent='TESTANDO';$('#blockAttempts').textContent='0';$('#blockResult').textContent='AGUARDANDO';
   const wrongPassword='LIMPO_INVALID_'+Date.now()+'_DO_NOT_USE';
-  let blocked=false;
+  let blocked=false,indeterminate=false;
   for(let i=1;i<=8&&blockRunning;i++){
     try{
       const r=await fetch('/url-auth-test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url,email,password:wrongPassword,authorized:true})});
-      const data=await r.json().catch(()=>({}));$('#blockAttempts').textContent=String(i);
-      const safe={attempt:i,status:r.status,error:data.error||null,providerCode:data.providerCode||null};
-      addLine($('#urlTerminal'),'Bloqueio #'+i+' → '+JSON.stringify(safe),r.status===429?'warn':'bad');
-      if(r.status===429||data.error==='rate_limited'){blocked=true;$('#blockStatus').textContent='BLOQUEADO';$('#blockResult').textContent='PROTEÇÃO DETECTADA';break}
-      if(r.status!==401){$('#blockStatus').textContent='INTERROMPIDO';$('#blockResult').textContent='RESPOSTA '+r.status;break}
+      const data=await r.json().catch(()=>({})),classification=urlClassification(data,r.status);$('#blockAttempts').textContent=String(i);
+      const safe={attempt:i,status:r.status,classification,error:data.error||null,providerCode:data.providerCode||null,providerHttpStatus:data.providerHttpStatus||null};
+      addLine($('#urlTerminal'),'Bloqueio #'+i+' → '+JSON.stringify(safe),classification==='BLOQUEADA'||classification==='INDETERMINADA'?'warn':'bad');
+      if(classification==='BLOQUEADA'){blocked=true;$('#blockStatus').textContent='BLOQUEADO';$('#blockResult').textContent='PROTEÇÃO DETECTADA';break}
+      if(classification==='INDETERMINADA'){indeterminate=true;$('#blockStatus').textContent='INTERROMPIDO';$('#blockResult').textContent='INDETERMINADO';break}
+      if(classification==='AUTENTICADA'){indeterminate=true;$('#blockStatus').textContent='INTERROMPIDO';$('#blockResult').textContent='RESPOSTA INESPERADA';break}
       if(i<8)await sleep(800);
-    }catch(e){$('#blockStatus').textContent='ERRO';$('#blockResult').textContent='FALHA DE REDE';addLine($('#urlTerminal'),'Teste de bloqueio falhou: '+e.message,'bad');break}
+    }catch(e){indeterminate=true;$('#blockStatus').textContent='INTERROMPIDO';$('#blockResult').textContent='INDETERMINADO';addLine($('#urlTerminal'),'Falha de rede; tentativa não foi classificada como inválida: '+e.message,'warn');break}
   }
-  if(!blocked&&$('#blockStatus').textContent==='TESTANDO'){ $('#blockStatus').textContent='CONCLUÍDO';$('#blockResult').textContent='SEM 429 EM 8 TENTATIVAS'; }
+  if(!blocked&&!indeterminate&&$('#blockStatus').textContent==='TESTANDO'){ $('#blockStatus').textContent='CONCLUÍDO';$('#blockResult').textContent='SEM BLOQUEIO EM 8 TENTATIVAS'; }
   blockRunning=false;$('#urlBlockBtn').disabled=false;
 };
 
