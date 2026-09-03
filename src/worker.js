@@ -1,4 +1,3 @@
-const attempts = new Map();
 const WINDOW_MS = 10_000;
 const MAX_ATTEMPTS = 5;
 const LOCK_MS = 15_000;
@@ -16,19 +15,15 @@ function json(data, status = 200, extra = {}) {
   return new Response(JSON.stringify(data), { status, headers: { ...cors, ...extra } });
 }
 
-export default {
+export class LoginLimiter {
+  constructor(ctx) {
+    this.ctx = ctx;
+  }
+
   async fetch(request) {
-    const url = new URL(request.url);
-
-    if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
-    if (url.pathname !== '/login' && url.pathname !== '/api/login') {
-      return json({ ok: true, service: 'Limpo HTTP Login Lab', endpoint: '/login' });
-    }
-    if (request.method !== 'POST') return json({ ok: false, error: 'method_not_allowed' }, 405);
-
     const now = Date.now();
-    const client = request.headers.get('CF-Connecting-IP') || 'lab-client';
-    const state = attempts.get(client) || { hits: [], lockedUntil: 0, total: 0 };
+    const stored = await this.ctx.storage.get('state');
+    const state = stored || { hits: [], lockedUntil: 0, total: 0 };
 
     if (state.lockedUntil > now) {
       const retryAfterMs = state.lockedUntil - now;
@@ -41,7 +36,7 @@ export default {
     if (state.hits.length >= MAX_ATTEMPTS) {
       state.lockedUntil = now + LOCK_MS;
       state.hits = [];
-      attempts.set(client, state);
+      await this.ctx.storage.put('state', state);
       return json({ ok: false, error: 'rate_limited', retryAfterMs: LOCK_MS, totalAttempts: state.total }, 429, {
         'Retry-After': String(Math.ceil(LOCK_MS / 1000))
       });
@@ -50,22 +45,42 @@ export default {
     let body = {};
     try { body = await request.json(); } catch {}
     const pin = String(body?.pin ?? '').replace(/\D/g, '').slice(0, 6);
+
     state.hits.push(now);
     state.total++;
-    attempts.set(client, state);
 
     if (pin === LAB_PIN) {
       state.hits = [];
       state.lockedUntil = 0;
-      attempts.set(client, state);
+      await this.ctx.storage.put('state', state);
       return json({ ok: true, message: 'PIN fictício correto', totalAttempts: state.total });
     }
 
+    await this.ctx.storage.put('state', state);
     return json({
       ok: false,
       error: 'invalid_pin',
       remaining: Math.max(0, MAX_ATTEMPTS - state.hits.length),
       totalAttempts: state.total
     }, 401);
+  }
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+
+    if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
+
+    if (url.pathname !== '/login' && url.pathname !== '/api/login') {
+      return env.ASSETS.fetch(request);
+    }
+
+    if (request.method !== 'POST') return json({ ok: false, error: 'method_not_allowed' }, 405);
+
+    const client = request.headers.get('CF-Connecting-IP') || 'lab-client';
+    const id = env.LOGIN_LIMITER.idFromName(client);
+    const stub = env.LOGIN_LIMITER.get(id);
+    return stub.fetch(request);
   }
 };
