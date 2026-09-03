@@ -1,9 +1,10 @@
 {
   "name": "limpo-lab",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
   "scripts": {
+    "check": "node --check src/auth-detector.js && node --check src/worker.js",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy"
   },
