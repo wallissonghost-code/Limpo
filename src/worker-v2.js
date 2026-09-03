@@ -32,14 +32,18 @@ function normalizePublicTarget(raw) {
 function summarize(discovery) {
   const resolved = resolveAdapter(discovery);
   const diagnostics = discovery?.diagnostics || {};
+  const provider = discovery?.provider || 'custom-or-unknown';
+  const unavailableReason = resolved.unavailableReason || null;
   return {
-    provider:discovery?.provider || 'custom-or-unknown',
+    technology:provider,
+    provider,
     confidence:discovery?.confidence || 'low',
     type:discovery?.type || 'authentication',
     detected:true,
-    adapter:resolved.adapter || 'detection-only',
+    adapter:resolved.testAvailable ? (resolved.adapter || null) : null,
     testAvailable:resolved.testAvailable === true,
-    unavailableReason:resolved.unavailableReason || null,
+    testUnavailableReason:unavailableReason,
+    unavailableReason,
     detections:discovery?.detections || [],
     evidence:discovery?.detections?.[0]?.evidence || [],
     endpoints:discovery?.endpoints || [],
@@ -99,7 +103,7 @@ async function detectOnly(request) {
   }
 }
 
-async function authTest(request, env) {
+async function authTest(request) {
   const checked = await parseAuthorizedRequest(request, true);
   if (checked.error) return checked.error;
   const started = Date.now();
@@ -108,7 +112,8 @@ async function authTest(request, env) {
   catch (error) { return json({ ok:false, detected:false, error:'target_unreachable', classification:'indeterminate', detail:String(error?.message || 'fetch_failed'), latencyMs:Date.now()-started }, 502); }
 
   const summary = summarize(discovery);
-  if (!summary.testAvailable) {
+  const resolved = resolveAdapter(discovery);
+  if (!summary.testAvailable || typeof resolved.test !== 'function') {
     return json({
       ok:true,
       ...summary,
@@ -117,23 +122,24 @@ async function authTest(request, env) {
       classification:'not_tested',
       authType:'detection-only',
       latencyMs:Date.now()-started,
-      message:'Tecnologia detectada com sucesso, mas este provedor ainda não possui adaptador compatível para teste de credencial.'
+      message:'Tecnologia detectada com sucesso, mas este provedor não possui adaptador compatível para teste de credencial.'
     }, 200);
   }
 
-  return legacyWorker.fetch(request, env);
-}
-
-async function withDiagnosticsModule(request, env) {
-  const response = await legacyWorker.fetch(request, env);
-  const type = String(response.headers.get('content-type') || '').toLowerCase();
-  if (request.method !== 'GET' || !type.includes('text/html') || !response.ok) return response;
-  const text = await response.text();
-  if (text.includes('/url-diagnostics.js')) return new Response(text, response);
-  const injected = text.replace('</body>', '<script src="/url-diagnostics.js"></script>\n</body>');
-  const headers = new Headers(response.headers);
-  headers.delete('content-length');
-  return new Response(injected, { status:response.status, statusText:response.statusText, headers });
+  const result = await resolved.test({
+    discovery,
+    email:String(checked.body.email || '').trim(),
+    password:String(checked.body.password || ''),
+    started
+  });
+  return json({
+    ...summary,
+    ...result.body,
+    adapter:resolved.adapter,
+    testAvailable:true,
+    testUnavailableReason:null,
+    unavailableReason:null
+  }, result.httpStatus);
 }
 
 export default {
@@ -146,8 +152,8 @@ export default {
     }
     if (url.pathname === '/url-auth-test') {
       if (request.method !== 'POST') return json({ ok:false, error:'method_not_allowed' }, 405);
-      return authTest(request, env);
+      return authTest(request);
     }
-    return withDiagnosticsModule(request, env);
+    return legacyWorker.fetch(request, env);
   }
 };
