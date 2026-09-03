@@ -30,7 +30,7 @@ export class LoginLimiter {
 
   async fetch(request) {
     const url = new URL(request.url);
-    const mode = url.pathname === '/auth/login' ? 'password' : 'pin';
+    const mode = url.pathname.includes('/auth/') || url.pathname.includes('/lab/vulnerable/') ? 'password' : 'pin';
     const stateKey = `state:${mode}`;
     const now = Date.now();
     const stored = await this.ctx.storage.get(stateKey);
@@ -96,12 +96,24 @@ export default {
 
     if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
 
-    const isApi = url.pathname === '/login' || url.pathname === '/api/login' || url.pathname === '/auth/login';
+    const isSecureLogin = url.pathname === '/auth/login';
+    const isVulnerableLogin = url.pathname === '/lab/vulnerable/login';
+    const isPin = url.pathname === '/login' || url.pathname === '/api/login';
+    const isApi = isSecureLogin || isVulnerableLogin || isPin;
     if (!isApi) return env.ASSETS.fetch(request);
     if (request.method !== 'POST') return json({ ok: false, error: 'method_not_allowed' }, 405);
 
-    const client = request.headers.get('CF-Connecting-IP') || 'lab-client';
-    const id = env.LOGIN_LIMITER.idFromName(client);
+    let body = {};
+    if (isVulnerableLogin) {
+      try { body = await request.clone().json(); } catch {}
+    }
+
+    const ip = request.headers.get('CF-Connecting-IP') || 'lab-client';
+    const clientKey = isVulnerableLogin
+      ? `vuln:${String(body?.labClientId || 'client-a').slice(0, 64)}`
+      : `secure:${ip}`;
+
+    const id = env.LOGIN_LIMITER.idFromName(clientKey);
     const stub = env.LOGIN_LIMITER.get(id);
     return stub.fetch(request);
   }
