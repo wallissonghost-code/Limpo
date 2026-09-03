@@ -49,6 +49,7 @@ function summarize(discovery) {
     endpoints:discovery?.endpoints || [],
     externalOrigins:discovery?.externalOrigins || [],
     scannedScripts:discovery?.scannedScripts || 0,
+    discoveredResources:discovery?.discoveredResources || diagnostics?.summary?.discovered || 0,
     finalOrigin:discovery?.finalOrigin || null,
     diagnostics:{
       initialStatus:diagnostics.initialStatus ?? null,
@@ -58,8 +59,17 @@ function summarize(discovery) {
       initialResources:diagnostics.initialResources || [],
       manifestProbes:diagnostics.manifestProbes || [],
       scannedResources:diagnostics.scannedResources || [],
+      ignoredResources:diagnostics.ignoredResources || [],
       failedResources:diagnostics.failedResources || [],
-      firebaseRuntimeProbe:diagnostics.firebaseRuntimeProbe || null
+      firebaseRuntimeProbe:diagnostics.firebaseRuntimeProbe || null,
+      summary:diagnostics.summary || {
+        discovered:discovery?.discoveredResources || 0,
+        analyzed:discovery?.scannedScripts || 0,
+        ignored:(diagnostics.ignoredResources || []).length,
+        failed:(diagnostics.failedResources || []).length,
+        partial:(diagnostics.scannedResources || []).filter(x=>x?.coverage === 'partial-head' || x?.coverage === 'partial-ranged').length,
+        ranged:(diagnostics.scannedResources || []).filter(x=>x?.coverage === 'partial-ranged').length
+      }
     }
   };
 }
