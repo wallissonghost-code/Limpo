@@ -30,7 +30,13 @@ async function analyzeForm(request){
 
 async function loginTest(request){
   if(request.method!=='POST')return json({error:'Use POST.'},405);
-  try{const body=await readBody(request);if(!body.url)throw new Error('Informe uma URL.');if(!body.email||!body.password)throw new Error('Informe e-mail/usuário e senha.');return json(await testLogin(String(body.url).trim(),String(body.email),String(body.password)));}
+  try{
+    const body=await readBody(request);
+    if(body.authorized!==true)throw new Error('Confirme que você tem autorização para testar este login.');
+    if(!body.url)throw new Error('Informe uma URL.');
+    if(!body.email||!body.password)throw new Error('Informe e-mail/usuário e senha.');
+    return json(await testLogin(String(body.url).trim(),String(body.email),String(body.password)));
+  }
   catch(error){const message=error?.name==='AbortError'?'O teste excedeu o tempo limite.':(error?.message||'Falha ao testar o login.');return json({error:message},400);}
 }
 
