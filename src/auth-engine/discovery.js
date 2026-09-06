@@ -1,13 +1,16 @@
-import { analyzeUrl } from '../auth-detector.js';
+import { analyzeUrlInternal } from '../auth-detector.js';
 import { inferCapabilities } from './capabilities.js';
+import { extractRuntimeConfig,publicRuntimeSummary } from './runtime-config.js';
 
 export async function discoverAuth(rawUrl){
-  const analysis=await analyzeUrl(rawUrl);
+  const {analysis,ctx}=await analyzeUrlInternal(rawUrl);
+  const providerId=analysis.providerId||'unknown';
+  const runtime=extractRuntimeConfig(providerId,ctx);
   return {
     status:analysis.status,
     detected:analysis.detected,
     provider:{
-      id:analysis.providerId||'unknown',
+      id:providerId,
       name:analysis.provider||'Unknown / Custom',
       confidence:analysis.confidence||0
     },
@@ -20,6 +23,13 @@ export async function discoverAuth(rawUrl){
     evidence:analysis.evidence,
     signals:analysis.signals,
     alternatives:analysis.alternatives,
-    coverage:analysis.coverage
+    coverage:analysis.coverage,
+    runtime,
+    configuration:publicRuntimeSummary(runtime)
   };
+}
+
+export function publicDiscovery(discovery){
+  const {runtime,...safe}=discovery||{};
+  return safe;
 }
