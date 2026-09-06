@@ -18,6 +18,37 @@ function json(data,status=200){
   });
 }
 
+function safeUrl(raw){
+  if(!raw)return null;
+  try{
+    const u=new URL(String(raw));
+    u.username='';
+    u.password='';
+    // Query parameters may contain public provider keys, tokens, codes or other
+    // values that are useful internally but should never be echoed to the UI.
+    u.search='';
+    u.hash='';
+    return u.toString();
+  }catch{
+    return null;
+  }
+}
+
+function safeLoginResult(result={}){
+  return {
+    ...result,
+    loginPage:safeUrl(result.loginPage),
+    submitUrl:safeUrl(result.submitUrl),
+    redirectTo:safeUrl(result.redirectTo),
+    discovery:result.discovery?{
+      ...result.discovery,
+      alternatives:Array.isArray(result.discovery.alternatives)
+        ? result.discovery.alternatives.map(safeUrl).filter(Boolean)
+        : result.discovery.alternatives
+    }:result.discovery
+  };
+}
+
 async function readBody(request){return await request.json().catch(()=>({}));}
 
 async function analyze(request){
@@ -43,16 +74,19 @@ async function analyzeForm(request){
 }
 
 async function directPasswordLogin(url,credentials){
-  // This is the exact proven transport path that powered /api/login-test before
-  // commit 76ebad3. Discovery/orchestration must never prevent a password
-  // attempt that this bounded single-attempt tester can reconstruct safely.
-  const result=await testLogin(url,credentials.username,credentials.password);
-  const verification=verifyLoginResult(result);
+  // Each request performs one bounded credential submission. LIMPO does not
+  // impose a local count/cooldown between separate manual requests, so the
+  // owner can repeat tests while debugging their own login.
+  const rawResult=await testLogin(url,credentials.username,credentials.password);
+  const verification=verifyLoginResult(rawResult);
+  const result=safeLoginResult(rawResult);
   return {
     ok:true,
     method:'password',
     pipeline:'direct-password',
-    adapter:{id:'direct-password',name:'Direct Password Login',provider:result?.provider||'generic',mode:'automated',ready:true},
+    attemptPolicy:'manual-repeat',
+    localAttemptLimit:null,
+    adapter:{id:'direct-password',name:'Direct Password Login',provider:rawResult?.provider||'generic',mode:'automated',ready:true},
     result,
     verification,
     status:verification.status,
@@ -60,12 +94,12 @@ async function directPasswordLogin(url,credentials){
     confidence:verification.confidence,
     evidence:verification.evidence,
     reason:verification.reason,
-    httpStatus:result?.httpStatus,
-    loginPage:result?.loginPage,
-    submitUrl:result?.submitUrl,
-    redirectTo:result?.redirectTo,
-    sessionCookieSet:Boolean(result?.sessionCookieSet),
-    note:result?.note||''
+    httpStatus:rawResult?.httpStatus,
+    loginPage:safeUrl(rawResult?.loginPage),
+    submitUrl:safeUrl(rawResult?.submitUrl),
+    redirectTo:safeUrl(rawResult?.redirectTo),
+    sessionCookieSet:Boolean(rawResult?.sessionCookieSet),
+    note:'Teste manual repetível. O LIMPO não aplica limite local entre cliques e não retorna senha, token, cookie ou parâmetros sensíveis de URL.'
   };
 }
 
@@ -80,9 +114,6 @@ async function loginTest(request){
     if(method==='password'&&(!credentials.username||!credentials.password))throw new Error('Informe e-mail/usuário e senha.');
     const url=String(body.url).trim();
 
-    // Password keeps the working legacy transport as the primary path. The
-    // Auth Engine remains responsible for discovery and non-password flows.
-    // This avoids a discovery/configuration failure blocking the actual login.
     if(method==='password')return json(await directPasswordLogin(url,credentials));
     return json(await runAuthTest({url,method,credentials}));
   }
