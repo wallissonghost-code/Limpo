@@ -22,16 +22,9 @@ function safeUrl(raw){
   if(!raw)return null;
   try{
     const u=new URL(String(raw));
-    u.username='';
-    u.password='';
-    // Query parameters may contain public provider keys, tokens, codes or other
-    // values that are useful internally but should never be echoed to the UI.
-    u.search='';
-    u.hash='';
+    u.username='';u.password='';u.search='';u.hash='';
     return u.toString();
-  }catch{
-    return null;
-  }
+  }catch{return null;}
 }
 
 function safeLoginResult(result={}){
@@ -74,9 +67,6 @@ async function analyzeForm(request){
 }
 
 async function directPasswordLogin(url,credentials){
-  // Each request performs one bounded credential submission. LIMPO does not
-  // impose a local count/cooldown between separate manual requests, so the
-  // owner can repeat tests while debugging their own login.
   const rawResult=await testLogin(url,credentials.username,credentials.password);
   const verification=verifyLoginResult(rawResult);
   const result=safeLoginResult(rawResult);
@@ -93,14 +83,29 @@ async function directPasswordLogin(url,credentials){
     success:verification.success,
     confidence:verification.confidence,
     evidence:verification.evidence,
-    reason:verification.reason,
+    reason:rawResult?.reason||verification.reason,
     httpStatus:rawResult?.httpStatus,
+    provider:rawResult?.provider||'generic',
+    failureType:rawResult?.failureType||null,
+    failureLabel:rawResult?.failureLabel||null,
+    blockSource:rawResult?.blockSource||null,
+    failureCode:rawResult?.failureCode||null,
+    retryAfter:rawResult?.retryAfter||null,
     loginPage:safeUrl(rawResult?.loginPage),
     submitUrl:safeUrl(rawResult?.submitUrl),
     redirectTo:safeUrl(rawResult?.redirectTo),
     sessionCookieSet:Boolean(rawResult?.sessionCookieSet),
     note:'Teste manual repetível. O LIMPO não aplica limite local entre cliques e não retorna senha, token, cookie ou parâmetros sensíveis de URL.'
   };
+}
+
+function localFailure(error){
+ const message=error?.name==='AbortError'?'O teste excedeu o tempo limite.':(error?.message||String(error||'Falha ao testar o login.'));
+ let failureType='LOCAL_ERROR';
+ if(/autorização/i.test(message))failureType='AUTHORIZATION_REQUIRED';
+ else if(/HTTPS|conexão insegura|localhost|privad|reservad|URL/i.test(message))failureType='LOCAL_SAFETY_BLOCK';
+ else if(/tempo limite|timeout/i.test(message))failureType='LOCAL_TIMEOUT';
+ return{error:message,stage:'login-execution',failureType,blockSource:'limpo',failureLabel:'Bloqueio/erro local do LIMPO'};
 }
 
 async function loginTest(request){
@@ -117,10 +122,7 @@ async function loginTest(request){
     if(method==='password')return json(await directPasswordLogin(url,credentials));
     return json(await runAuthTest({url,method,credentials}));
   }
-  catch(error){
-    const message=error?.name==='AbortError'?'O teste excedeu o tempo limite.':(error?.message||String(error||'Falha ao testar o login.'));
-    return json({error:message,stage:'login-execution'},400);
-  }
+  catch(error){return json(localFailure(error),400);}
 }
 
 export default {
@@ -137,7 +139,7 @@ export default {
     }catch(error){
       if(url.pathname.startsWith('/api/')){
         const message=error?.name==='AbortError'?'A operação excedeu o tempo limite.':(error?.message||String(error||'Falha interna na API do LIMPO.'));
-        return json({error:message,stage:'worker'},500);
+        return json({error:message,stage:'worker',failureType:'LOCAL_ERROR',blockSource:'limpo'},500);
       }
       throw error;
     }
