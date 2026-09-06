@@ -12,11 +12,7 @@ function publicContext(ctx){
   };
 }
 
-export async function analyzeUrl(rawUrl){
-  const ctx=await scanTarget(rawUrl);
-  await runPublicProbes(ctx,ctx.finalUrl,ctx.corpus.join('\n'));
-  detectGenericAuth(ctx);
-  const result=classify(ctx);
+function toPublicResult(ctx,result){
   const note = result.status==='AUTH_DETECTED'
     ? 'Autenticação detectada a partir de sinais públicos. A classificação do provedor é separada do tipo/protocolo de autenticação.'
     : result.status==='AUTH_UNKNOWN'
@@ -43,4 +39,17 @@ export async function analyzeUrl(rawUrl){
     alternatives:result.alternatives,
     note
   };
+}
+
+export async function analyzeUrlInternal(rawUrl){
+  const ctx=await scanTarget(rawUrl);
+  await runPublicProbes(ctx,ctx.finalUrl,ctx.corpus.join('\n'));
+  detectGenericAuth(ctx);
+  const result=classify(ctx);
+  return {analysis:toPublicResult(ctx,result),ctx,result};
+}
+
+export async function analyzeUrl(rawUrl){
+  const {analysis}=await analyzeUrlInternal(rawUrl);
+  return analysis;
 }
