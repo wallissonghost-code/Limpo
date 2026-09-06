@@ -14,7 +14,6 @@ function publicContext(ctx){
 
 export async function analyzeUrl(rawUrl){
   const ctx=await scanTarget(rawUrl);
-  detectGenericAuth(ctx);
   await runPublicProbes(ctx,ctx.finalUrl,ctx.corpus.join('\n'));
   detectGenericAuth(ctx);
   const result=classify(ctx);
