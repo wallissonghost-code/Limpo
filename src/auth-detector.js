@@ -1,6 +1,7 @@
 import { scanTarget } from './detector/scanner.js';
 import { classify } from './detector/classifier.js';
 import { runPublicProbes } from './detector/probes.js';
+import { detectGenericAuth } from './detector/generic.js';
 
 function publicContext(ctx){
   return {
@@ -13,7 +14,9 @@ function publicContext(ctx){
 
 export async function analyzeUrl(rawUrl){
   const ctx=await scanTarget(rawUrl);
+  detectGenericAuth(ctx);
   await runPublicProbes(ctx,ctx.finalUrl,ctx.corpus.join('\n'));
+  detectGenericAuth(ctx);
   const result=classify(ctx);
   const note = result.status==='AUTH_DETECTED'
     ? 'Autenticação detectada a partir de sinais públicos. A classificação do provedor é separada do tipo/protocolo de autenticação.'
