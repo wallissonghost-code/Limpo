@@ -72,15 +72,32 @@ async function chooseLoginTransport(html,base){
 
  if(d.candidate){const action=new URL(d.candidate.url);return{transport:'javascript-api',provider:'custom',action:d.candidate.url,userName,passName,hidden:[],headers:{},crossOrigin:action.origin!==baseUrl.origin,submitOrigin:action.origin,contentType:'application/json',discovery:{scriptsScanned:d.scriptsScanned,mapsScanned:d.mapsScanned,kind:d.candidate.kind,score:d.candidate.score,alternatives:d.alternatives.map(x=>x.url)}};}
 
- // A form whose browser default is GET is only a weak HTML hint. Modern apps
- // frequently intercept submit in JavaScript. Never send the password by URL,
- // but also never stop solely because the static form looks like GET.
  throw new Error(`O fluxo de senha não pôde ser reconstruído após analisar ${d.scriptsScanned} arquivo(s) JavaScript${d.mapsScanned?` e ${d.mapsScanned} source map(s)`:''}. O LIMPO não enviou a credencial porque nenhum transporte HTTPS de autenticação foi confirmado.`);
 }
 
 function looksLikeFailure(text){return /(invalid|incorrect|wrong|failed|erro|inválid|incorret|senha incorreta|credenciais|try again|tente novamente|unauthorized|bad credentials|invalid_login_credentials)/i.test(text);}
 function parseJson(text){try{return JSON.parse(text);}catch{return null;}}
 function stillHasLogin(text){return /<input\b[^>]*type\s*=\s*["']?password/i.test(text)||/(sign\s*in|log\s*in|entrar|acessar)[\s\S]{0,500}(password|senha)/i.test(text);}
+function cleanCode(v){return String(v||'').trim().slice(0,120).replace(/[^A-Za-z0-9_.:-]/g,'_');}
+function providerErrorCode(provider,payload,text){
+ if(provider==='firebase')return cleanCode(payload?.error?.message||payload?.error?.status||'');
+ if(provider==='supabase')return cleanCode(payload?.code||payload?.error_code||payload?.error||'');
+ return cleanCode(payload?.code||payload?.error?.code||payload?.error||'');
+}
+function classifyFailure({provider,httpStatus,payload,text,headers}){
+ const rawCode=providerErrorCode(provider,payload,text);const hay=`${rawCode} ${payload?.error?.message||''} ${payload?.message||''} ${text}`.toLowerCase();
+ const source=provider==='firebase'?'firebase':provider==='supabase'?'supabase':'target';
+ let type='AUTH_REJECTED',label='Autenticação recusada';
+ if(httpStatus===429||/too[_ -]?many[_ -]?(attempts|requests)|rate[_ -]?limit|over_request_rate_limit|temporarily blocked|try again later|quota exceeded/.test(hay)){type='RATE_LIMITED';label='Limite de tentativas atingido';}
+ else if(/user[_ -]?disabled|account[_ -]?(disabled|locked|blocked|suspended)|user_banned|banned/.test(hay)){type='ACCOUNT_BLOCKED';label='Conta bloqueada/desativada';}
+ else if(/mfa|multi.?factor|second.?factor|totp|required.*verification/.test(hay)){type='MFA_REQUIRED';label='MFA/verificação adicional obrigatória';}
+ else if(/captcha|challenge|recaptcha/.test(hay)){type='CHALLENGE_REQUIRED';label='CAPTCHA/desafio obrigatório';}
+ else if(/operation[_ -]?not[_ -]?allowed|provider.*disabled|password.*disabled|sign.?in.*disabled/.test(hay)){type='PROVIDER_DISABLED';label='Método de login desativado';}
+ else if(/invalid[_ -]?login[_ -]?credentials|invalid[_ -]?password|wrong[_ -]?password|bad credentials|email[_ -]?not[_ -]?found|invalid credentials|invalid_credentials/.test(hay)){type='INVALID_CREDENTIALS';label='Credencial inválida';}
+ else if(httpStatus===403){type='ACCESS_DENIED';label='Acesso negado';}
+ const retryAfter=headers?.get?.('retry-after')||null;
+ return{failureType:type,failureLabel:label,blockSource:source,failureCode:rawCode||null,retryAfter:retryAfter?String(retryAfter).slice(0,80):null};
+}
 
 export async function testLogin(rawUrl,email,password){
  if(!email||!password)throw new Error('Informe e-mail/usuário e senha.');if(String(password).length>512||String(email).length>320)throw new Error('Credenciais inválidas.');
@@ -94,9 +111,11 @@ export async function testLogin(rawUrl,email,password){
  const payload=parseJson(responseText);const tokenReturned=Boolean(payload?.idToken||payload?.access_token||payload?.accessToken||payload?.token);const userReturned=Boolean(payload?.user||payload?.localId);const authenticatedFlag=payload?.authenticated===true;const successFlag=payload?.success===true;const providerAcceptedCredential=Boolean((login.provider==='firebase'&&submit.ok&&payload?.idToken)||(login.provider==='supabase'&&submit.ok&&(payload?.access_token||payload?.user)));
  let status='LOGIN_INCONCLUSIVE',success=null,reason='A resposta não fornece sinal suficiente para confirmar o resultado.';
  if([301,302,303,307,308].includes(submit.status)&&location){const dest=new URL(location,login.action);if(!/(login|signin|sign-in|auth)/i.test(dest.pathname)){status='LOGIN_SUCCESS';success=true;reason='O servidor redirecionou para fora da rota de login após o POST.';}else{status='LOGIN_FAILED';success=false;reason='O servidor redirecionou de volta para uma rota de login/autenticação.';}}
- if(success===null&&(submit.status===401||submit.status===403)){status='LOGIN_FAILED';success=false;reason=`O servidor respondeu HTTP ${submit.status}.`;}
+ if(success===null&&(submit.status===401||submit.status===403||submit.status===429)){status='LOGIN_FAILED';success=false;reason=`O servidor respondeu HTTP ${submit.status}.`;}
  if(success===null&&looksLikeFailure(responseText)){status='LOGIN_FAILED';success=false;reason='A resposta contém mensagem compatível com falha de autenticação.';}
  if(success===null&&submit.ok&&(tokenReturned||userReturned||authenticatedFlag||successFlag||providerAcceptedCredential)){status='LOGIN_SUCCESS';success=true;reason='A resposta trouxe evidência explícita de autenticação bem-sucedida.';}
  if(success===null&&submit.ok&&cookieSet&&!stillHasLogin(responseText)){status='LOGIN_SUCCESS';success=true;reason='A resposta foi aceita, definiu cookie de sessão e não apresentou novamente o formulário de login.';}
- return{ok:true,status,success,httpStatus:submit.status,transport:login.transport,provider:login.provider,loginPage:finalUrl.toString(),submitUrl:login.action,submitOrigin:login.submitOrigin,crossOrigin:login.crossOrigin,redirectTo:location?new URL(location,login.action).toString():null,sessionCookieSet:cookieSet,tokenReturned,userReturned,authenticatedFlag,successFlag,providerAcceptedCredential,providerRejectedCredential:status==='LOGIN_FAILED'&&(login.provider==='firebase'||login.provider==='supabase'),explicitFailure:status==='LOGIN_FAILED',discovery:login.discovery,reason,note:`Uma única tentativa via ${login.transport}. ${login.crossOrigin?'O destino de autenticação usa outro domínio HTTPS. ':''}O LIMPO não retorna nem armazena senha, valor de cookie ou token.`};
+ const failure=status==='LOGIN_FAILED'?classifyFailure({provider:login.provider,httpStatus:submit.status,payload,text:responseText,headers:submit.headers}):{failureType:null,failureLabel:null,blockSource:null,failureCode:null,retryAfter:null};
+ if(failure.failureType==='RATE_LIMITED')reason=`${failure.failureLabel} pelo ${failure.blockSource==='firebase'?'Firebase':failure.blockSource==='supabase'?'Supabase':'sistema analisado'}.`;
+ return{ok:true,status,success,httpStatus:submit.status,transport:login.transport,provider:login.provider,loginPage:finalUrl.toString(),submitUrl:login.action,submitOrigin:login.submitOrigin,crossOrigin:login.crossOrigin,redirectTo:location?new URL(location,login.action).toString():null,sessionCookieSet:cookieSet,tokenReturned,userReturned,authenticatedFlag,successFlag,providerAcceptedCredential,providerRejectedCredential:status==='LOGIN_FAILED'&&(login.provider==='firebase'||login.provider==='supabase'),explicitFailure:status==='LOGIN_FAILED',...failure,discovery:login.discovery,reason,note:`Uma única tentativa via ${login.transport}. ${login.crossOrigin?'O destino de autenticação usa outro domínio HTTPS. ':''}O LIMPO não retorna nem armazena senha, valor de cookie ou token.`};
 }
