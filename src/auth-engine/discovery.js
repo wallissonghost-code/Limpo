@@ -1,16 +1,18 @@
 import { analyzeUrl } from '../auth-detector.js';
 import { inferCapabilities } from './capabilities.js';
-import { adapterMatrixFor } from './registry.js';
 
 export async function discoverAuth(rawUrl){
   const analysis=await analyzeUrl(rawUrl);
-  const capabilities=inferCapabilities(analysis);
-  const discovery={
+  return {
     status:analysis.status,
     detected:analysis.detected,
-    provider:{id:analysis.providerId||'unknown',name:analysis.provider||'Unknown / Custom',confidence:analysis.confidence||0},
+    provider:{
+      id:analysis.providerId||'unknown',
+      name:analysis.provider||'Unknown / Custom',
+      confidence:analysis.confidence||0
+    },
     authentication:analysis.authentication,
-    capabilities,
+    capabilities:inferCapabilities(analysis),
     flow:analysis.flow,
     mfa:analysis.mfa,
     frameworks:analysis.frameworks,
@@ -20,6 +22,4 @@ export async function discoverAuth(rawUrl){
     alternatives:analysis.alternatives,
     coverage:analysis.coverage
   };
-  discovery.adapters=adapterMatrixFor(discovery);
-  return discovery;
 }
