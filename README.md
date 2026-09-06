@@ -17,17 +17,27 @@ Detector de tecnologia de autenticação por URL.
 
 O sistema analisa apenas sinais publicamente expostos pela página: HTML, scripts, URLs de recursos e padrões conhecidos. O resultado é probabilístico e inclui nível de confiança e evidências.
 
-## Executar
+## Cloudflare
 
-Projeto preparado para Vercel (frontend estático + função serverless Node.js).
+Projeto preparado para Cloudflare Workers com Static Assets.
 
 ```bash
 npm install
-npx vercel dev
+npm run dev
 ```
 
-Depois abra a URL local mostrada pelo Vercel CLI.
+Para publicar:
+
+```bash
+npm run deploy
+```
+
+Arquivos principais:
+
+- `worker.js`: API `/api/analyze` e lógica de detecção.
+- `public/index.html`: interface web.
+- `wrangler.jsonc`: configuração do Cloudflare Worker.
 
 ## Segurança
 
-A API aceita somente HTTP/HTTPS, bloqueia localhost e endereços IP privados/reservados e limita tamanho e tempo de resposta para reduzir risco de SSRF e abuso.
+A API aceita somente HTTP/HTTPS, bloqueia localhost e IPs privados/reservados informados diretamente, limita redirecionamentos, tamanho de resposta e tempo de análise para reduzir risco de abuso.
