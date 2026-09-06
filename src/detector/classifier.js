@@ -1,10 +1,21 @@
 import { providers } from '../providers/index.js';
 import { providerScore, authBehaviorScore } from './scoring.js';
 
+const PROVIDER_SIGNAL_TYPES={
+  firebase:['firebase_runtime_config'],
+  supabase:['supabase_runtime_config'],
+  auth0:['auth0_runtime_config'],
+  cognito:['cognito_runtime_config']
+};
+
 function providerResults(ctx){
   const results=[];
   for(const p of providers){
     const evidence=p.detect(ctx);
+    const signalTypes=PROVIDER_SIGNAL_TYPES[p.id]||[];
+    for(const signal of ctx.signals){
+      if(signalTypes.includes(signal.type)) evidence.push({...signal,provider:p.id,label:signal.label||signal.type});
+    }
     const scored=providerScore(evidence);
     if(scored.score>0)results.push({id:p.id,name:p.name,...scored});
   }
@@ -16,7 +27,7 @@ function inferAuthType(ctx){
   const corpus=ctx.corpus.join('\n');
   if(/webauthn|passkey/i.test(corpus))return 'passkey';
   if(/signInWithOtp|magic[-_ ]?link|otp/i.test(corpus))return 'otp/magic-link';
-  if(/type=["']password["']|password/i.test(corpus))return 'password';
+  if(/type=["']password["']|\bpassword\b/i.test(corpus))return 'password';
   if(ctx.flow.sso)return 'sso';
   return 'unknown';
 }
@@ -42,25 +53,6 @@ export function classify(ctx){
   else if(authDetected){provider={id:'custom',name:'Custom / Unknown provider',confidence:behavior.confidence,score:behavior.score,evidence:behavior.signals.slice(0,14)};}
   else if(best){provider={id:'unknown',name:'Unknown / Custom',confidence:best.confidence,score:best.score,evidence:best.evidence};}
 
-  const authentication={
-    type:inferAuthType(ctx),
-    protocol:inferProtocol(ctx,providerConfirmed?best:null),
-    session:ctx.authentication.session,
-    token:ctx.authentication.token
-  };
-
-  return {
-    status,
-    detected:status==='AUTH_DETECTED',
-    provider,
-    authentication,
-    flow:{...ctx.flow},
-    mfa:{detected:ctx.flow.mfa,methods:[...ctx.mfa.methods]},
-    frameworks:[...ctx.frameworks],
-    cookieNames:[...ctx.cookieNames],
-    signals:behavior.signals.slice(0,30),
-    alternatives:providerCandidates.slice(providerConfirmed?1:0,4).map(x=>({id:x.id,name:x.name,score:x.score,confidence:x.confidence,confirmed:x.confirmed})),
-    confidence:providerConfirmed?best.confidence:behavior.confidence,
-    score:providerConfirmed?best.score:behavior.score
-  };
+  const authentication={type:inferAuthType(ctx),protocol:inferProtocol(ctx,providerConfirmed?best:null),session:ctx.authentication.session,token:ctx.authentication.token};
+  return {status,detected:status==='AUTH_DETECTED',provider,authentication,flow:{...ctx.flow},mfa:{detected:ctx.flow.mfa,methods:[...ctx.mfa.methods]},frameworks:[...ctx.frameworks],cookieNames:[...ctx.cookieNames],signals:behavior.signals.slice(0,30),alternatives:providerCandidates.slice(providerConfirmed?1:0,4).map(x=>({id:x.id,name:x.name,score:x.score,confidence:x.confidence,confirmed:x.confirmed})),confidence:providerConfirmed?best.confidence:behavior.confidence,score:providerConfirmed?best.score:behavior.score};
 }
