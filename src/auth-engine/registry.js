@@ -5,9 +5,10 @@ import cognitoPassword from './adapters/cognito-password.js';
 import clerkPassword from './adapters/clerk-password.js';
 import oauth from './adapters/oauth.js';
 import oidc from './adapters/oidc.js';
+import interactive from './adapters/interactive.js';
 import customForm from './adapters/custom-form.js';
 
-export const adapters=[firebasePassword,supabasePassword,auth0Password,cognitoPassword,clerkPassword,oidc,oauth,customForm]
+export const adapters=[firebasePassword,supabasePassword,auth0Password,cognitoPassword,clerkPassword,oidc,oauth,interactive,customForm]
   .sort((a,b)=>(b.priority||0)-(a.priority||0));
 
 export function adapterMatrixFor(discovery){
