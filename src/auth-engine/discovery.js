@@ -1,12 +1,14 @@
 import { analyzeUrlInternal } from '../auth-detector.js';
 import { inferCapabilities } from './capabilities.js';
 import { reconstructRuntimeConfig,publicRuntimeSummary } from './runtime-config.js';
+import { resolveRuntimeBindings } from './runtime-resolver.js';
 import { reconstructFlowModel,publicFlowSummary } from './flow-reconstructor.js';
 
 export async function discoverAuth(rawUrl){
   const {analysis,ctx}=await analyzeUrlInternal(rawUrl);
   const providerId=analysis.providerId||'unknown';
-  const runtime=await reconstructRuntimeConfig(providerId,ctx);
+  let runtime=await reconstructRuntimeConfig(providerId,ctx);
+  runtime=resolveRuntimeBindings(providerId,ctx,runtime);
   const flowModel=reconstructFlowModel(providerId,ctx,runtime);
   return {
     status:analysis.status,
