@@ -1,6 +1,6 @@
 import { analyzeUrl } from './src/auth-detector.js';
 import { detectLoginForm } from './src/form-detector.js';
-import { discoverAuth } from './src/auth-engine/discovery.js';
+import { discoverAuth,publicDiscovery } from './src/auth-engine/discovery.js';
 import { adapterMatrixFor } from './src/auth-engine/registry.js';
 import { runAuthTest } from './src/auth-engine/orchestrator.js';
 
@@ -29,7 +29,7 @@ async function discover(request){
   try{
     const body=await readBody(request);if(!body.url)throw new Error('Informe uma URL.');
     const discovery=await discoverAuth(String(body.url).trim());
-    return json({...discovery,adapters:adapterMatrixFor(discovery)});
+    return json({...publicDiscovery(discovery),adapters:adapterMatrixFor(discovery)});
   }
   catch(error){const message=error?.name==='AbortError'?'A descoberta excedeu o tempo limite.':(error?.message||'Falha ao descobrir o mecanismo de autenticação.');return json({error:message},400);}
 }
