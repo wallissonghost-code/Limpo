@@ -1,11 +1,11 @@
 import { analyzeUrlInternal } from '../auth-detector.js';
 import { inferCapabilities } from './capabilities.js';
-import { extractRuntimeConfig,publicRuntimeSummary } from './runtime-config.js';
+import { reconstructRuntimeConfig,publicRuntimeSummary } from './runtime-config.js';
 
 export async function discoverAuth(rawUrl){
   const {analysis,ctx}=await analyzeUrlInternal(rawUrl);
   const providerId=analysis.providerId||'unknown';
-  const runtime=extractRuntimeConfig(providerId,ctx);
+  const runtime=await reconstructRuntimeConfig(providerId,ctx);
   return {
     status:analysis.status,
     detected:analysis.detected,
