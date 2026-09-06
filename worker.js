@@ -57,11 +57,20 @@ async function loginTest(request){
 export default {
   async fetch(request,env){
     const url=new URL(request.url);
-    if(url.pathname==='/api/analyze')return analyze(request);
-    if(url.pathname==='/api/discover')return discover(request);
-    if(url.pathname==='/api/form-detect')return analyzeForm(request);
-    if(url.pathname==='/api/login-test')return loginTest(request);
-    if(env.ASSETS)return env.ASSETS.fetch(request);
-    return new Response('LIMPO Auth Engine',{status:200});
+    try{
+      if(url.pathname==='/api/analyze')return await analyze(request);
+      if(url.pathname==='/api/discover')return await discover(request);
+      if(url.pathname==='/api/form-detect')return await analyzeForm(request);
+      if(url.pathname==='/api/login-test')return await loginTest(request);
+      if(url.pathname.startsWith('/api/'))return json({error:`Endpoint da API não encontrado: ${url.pathname}`},404);
+      if(env.ASSETS)return env.ASSETS.fetch(request);
+      return new Response('LIMPO Auth Engine',{status:200});
+    }catch(error){
+      if(url.pathname.startsWith('/api/')){
+        const message=error?.name==='AbortError'?'A operação excedeu o tempo limite.':(error?.message||'Falha interna na API do LIMPO.');
+        return json({error:message},500);
+      }
+      throw error;
+    }
   }
 };
