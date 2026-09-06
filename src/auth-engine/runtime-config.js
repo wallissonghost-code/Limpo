@@ -2,6 +2,8 @@ import { parseTarget } from '../detector/scanner.js';
 
 const TIMEOUT=4500;
 const MAX_BYTES=220_000;
+const BUNDLE_SLICE=180_000;
+const BUNDLE_BUDGET=2_400_000;
 
 function normalize(text=''){
   return String(text)
@@ -25,9 +27,6 @@ function firebaseApiKey(text){
     /["'](?:apiKey|firebaseApiKey|FIREBASE_API_KEY|NEXT_PUBLIC_FIREBASE_API_KEY|VITE_FIREBASE_API_KEY|REACT_APP_FIREBASE_API_KEY)["']\s*:\s*["']([A-Za-z0-9_\-]{20,})["']/i
   ]);
   if(explicit)return explicit;
-
-  // Bundlers can minify away the property name. Only accept a Google API-key-shaped
-  // literal when its immediate neighborhood also contains Firebase-specific context.
   const re=/AIza[0-9A-Za-z_\-]{30,}/g;let m;
   while((m=re.exec(text))){
     const around=text.slice(Math.max(0,m.index-1200),Math.min(text.length,m.index+1200));
@@ -78,18 +77,19 @@ async function readLimited(response,max=MAX_BYTES){
   return new TextDecoder().decode(out);
 }
 
-async function fetchPublicConfig(url){
+async function safeFetch(url,headers={}){
   let target;try{target=parseTarget(url);}catch{return null;}
   if(target.protocol!=='https:')return null;
   const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),TIMEOUT);
-  try{
-    const r=await fetch(target.toString(),{redirect:'follow',signal:controller.signal,headers:{'user-agent':'LIMPO-Auth-Engine/1.1','accept':'application/json,text/javascript,text/plain,*/*;q=0.4'}});
-    if(!r.ok)return null;
-    const text=await readLimited(r);return text||null;
-  }catch{return null;}finally{clearTimeout(timer);}
+  try{return await fetch(target.toString(),{redirect:'follow',signal:controller.signal,headers:{'user-agent':'LIMPO-Auth-Engine/1.2',...headers}});}catch{return null;}finally{clearTimeout(timer);}
 }
 
-async function enrichFirebase(initial){
+async function fetchPublicConfig(url){
+  const r=await safeFetch(url,{'accept':'application/json,text/javascript,text/plain,*/*;q=0.4'});
+  if(!r?.ok)return null;const text=await readLimited(r);return text||null;
+}
+
+async function enrichFirebaseFromHost(initial){
   if(initial.apiKey)return initial;
   const hosts=[];
   if(initial.authDomain)hosts.push(initial.authDomain);
@@ -98,13 +98,40 @@ async function enrichFirebase(initial){
     for(const path of ['/__/firebase/init.json','/__/firebase/init.js']){
       const text=await fetchPublicConfig(`https://${host}${path}`);if(!text)continue;
       const found=firebaseConfig(text);
-      if(found.apiKey)return {
-        apiKey:found.apiKey,
-        authDomain:found.authDomain||initial.authDomain,
-        projectId:found.projectId||initial.projectId,
-        passwordFlow:initial.passwordFlow||found.passwordFlow,
-        source:'firebase-runtime-probe'
-      };
+      if(found.apiKey)return {apiKey:found.apiKey,authDomain:found.authDomain||initial.authDomain,projectId:found.projectId||initial.projectId,passwordFlow:initial.passwordFlow||found.passwordFlow,source:'firebase-runtime-probe'};
+    }
+  }
+  return initial;
+}
+
+async function bundleTotal(url){
+  const r=await safeFetch(url,{'accept':'application/javascript,text/javascript,*/*;q=0.4','range':'bytes=0-0'});if(!r?.ok&&r?.status!==206)return 0;
+  const cr=r.headers.get('content-range')||'';const total=Number((cr.match(/\/(\d+)$/)||[])[1]||r.headers.get('content-length')||0);
+  try{await r.body?.cancel();}catch{}
+  return total;
+}
+
+async function fetchBundleRange(url,start,end){
+  const r=await safeFetch(url,{'accept':'application/javascript,text/javascript,*/*;q=0.4','range':`bytes=${start}-${end}`});
+  if(!r?.ok&&r?.status!==206)return'';return await readLimited(r,BUNDLE_SLICE);
+}
+
+async function enrichFirebaseFromBundles(initial,ctx){
+  if(initial.apiKey)return initial;
+  const scripts=[...new Set(ctx?.resources?.scripts||[])].slice(0,8);let spent=0;
+  for(const url of scripts){
+    const total=await bundleTotal(url);if(!total)continue;
+    const starts=total<=BUNDLE_SLICE*3
+      ? [0]
+      : [0,Math.floor(total*.2),Math.floor(total*.4),Math.floor(total*.6),Math.max(0,total-BUNDLE_SLICE)];
+    for(const rawStart of [...new Set(starts)]){
+      if(spent+BUNDLE_SLICE>BUNDLE_BUDGET)return initial;
+      const start=Math.max(0,Math.min(rawStart,total-1));const end=Math.min(total-1,start+BUNDLE_SLICE-1);
+      const text=await fetchBundleRange(url,start,end);spent+=BUNDLE_SLICE;if(!text)continue;
+      const found=firebaseConfig(text);
+      if(found.apiKey)return {apiKey:found.apiKey,authDomain:found.authDomain||initial.authDomain,projectId:found.projectId||initial.projectId,passwordFlow:initial.passwordFlow||found.passwordFlow,source:'targeted-bundle-scan'};
+      if(!initial.authDomain&&found.authDomain)initial.authDomain=found.authDomain;
+      if(!initial.projectId&&found.projectId)initial.projectId=found.projectId;
     }
   }
   return initial;
@@ -119,7 +146,11 @@ export function extractRuntimeConfig(providerId,ctx){
 
 export async function reconstructRuntimeConfig(providerId,ctx){
   const runtime=extractRuntimeConfig(providerId,ctx);
-  if(providerId==='firebase'&&runtime.firebase)runtime.firebase=await enrichFirebase(runtime.firebase);
+  if(providerId==='firebase'&&runtime.firebase){
+    runtime.firebase=await enrichFirebaseFromHost(runtime.firebase);
+    runtime.firebase=await enrichFirebaseFromBundles(runtime.firebase,ctx);
+    runtime.firebase=await enrichFirebaseFromHost(runtime.firebase);
+  }
   return runtime;
 }
 
