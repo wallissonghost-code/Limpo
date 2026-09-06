@@ -1,18 +1,30 @@
 import { parseTarget } from '../detector/scanner.js';
 
 const TIMEOUT=4500;
-const MAX_BYTES=220_000;
-const BUNDLE_SLICE=180_000;
-const BUNDLE_BUDGET=2_400_000;
+const MAX_BYTES=300_000;
+const BUNDLE_SLICE=220_000;
+const BUNDLE_BUDGET=3_600_000;
+const MAP_BYTES=650_000;
+const MAX_MAPS=5;
+const MAX_CONFIG_ENDPOINTS=5;
 
 function normalize(text=''){
-  return String(text)
+  let out=String(text)
     .replace(/\\u002[fF]/g,'/')
     .replace(/\\u003[aA]/g,':')
     .replace(/\\u0026/g,'&')
     .replace(/\\\//g,'/')
     .replace(/\\"/g,'"')
     .replace(/\\'/g,"'");
+
+  // Fold simple minifier/build-tool string concatenations such as
+  // "AIza..." + "rest" without evaluating arbitrary JavaScript.
+  for(let i=0;i<4;i++){
+    const next=out.replace(/(["'`])([^"'`\n]{1,180})\1\s*\+\s*(["'`])([^"'`\n]{1,180})\3/g,(_,q1,a,q2,b)=>`${q1}${a}${b}${q1}`);
+    if(next===out)break;
+    out=next;
+  }
+  return out;
 }
 
 function first(text,patterns){
@@ -23,36 +35,52 @@ function first(text,patterns){
 function firebaseApiKey(text){
   const explicit=first(text,[
     /[?&]key=([A-Za-z0-9_\-]{20,})/i,
-    /\b(?:apiKey|firebaseApiKey|FIREBASE_API_KEY|NEXT_PUBLIC_FIREBASE_API_KEY|VITE_FIREBASE_API_KEY|REACT_APP_FIREBASE_API_KEY|NUXT_PUBLIC_FIREBASE_API_KEY)\b\s*[:=]\s*["'`]([A-Za-z0-9_\-]{20,})["'`]/i,
-    /["'](?:apiKey|firebaseApiKey|FIREBASE_API_KEY|NEXT_PUBLIC_FIREBASE_API_KEY|VITE_FIREBASE_API_KEY|REACT_APP_FIREBASE_API_KEY)["']\s*:\s*["']([A-Za-z0-9_\-]{20,})["']/i
+    /\b(?:apiKey|firebaseApiKey|FIREBASE_API_KEY|NEXT_PUBLIC_FIREBASE_API_KEY|VITE_FIREBASE_API_KEY|REACT_APP_FIREBASE_API_KEY|NUXT_PUBLIC_FIREBASE_API_KEY|PUBLIC_FIREBASE_API_KEY)\b\s*[:=]\s*["'`]([A-Za-z0-9_\-]{20,})["'`]/i,
+    /["'](?:apiKey|firebaseApiKey|FIREBASE_API_KEY|NEXT_PUBLIC_FIREBASE_API_KEY|VITE_FIREBASE_API_KEY|REACT_APP_FIREBASE_API_KEY|PUBLIC_FIREBASE_API_KEY)["']\s*:\s*["']([A-Za-z0-9_\-]{20,})["']/i,
+    /accounts:signInWithPassword[^\n]{0,500}?[?&]key=([A-Za-z0-9_\-]{20,})/i,
+    /identitytoolkit\.googleapis\.com[^\n]{0,700}?[?&]key=([A-Za-z0-9_\-]{20,})/i
   ]);
   if(explicit)return explicit;
+
+  // Firebase Web API keys are public client configuration and normally start with AIza.
+  // Only accept a bare candidate when nearby context independently points to Firebase.
   const re=/AIza[0-9A-Za-z_\-]{30,}/g;let m;
   while((m=re.exec(text))){
-    const around=text.slice(Math.max(0,m.index-1200),Math.min(text.length,m.index+1200));
-    if(/firebase|initializeApp|firebaseapp\.com|identitytoolkit|securetoken|authDomain|projectId|signInWithEmailAndPassword/i.test(around))return m[0];
+    const around=text.slice(Math.max(0,m.index-1800),Math.min(text.length,m.index+1800));
+    if(/firebase|initializeApp|getAuth|firebaseapp\.com|identitytoolkit|securetoken|authDomain|projectId|signInWithEmailAndPassword|signInWithPassword/i.test(around))return m[0];
   }
   return null;
+}
+
+function mergeFirebase(base={},found={},source){
+  return {
+    apiKey:base.apiKey||found.apiKey||null,
+    authDomain:base.authDomain||found.authDomain||null,
+    projectId:base.projectId||found.projectId||null,
+    passwordFlow:Boolean(base.passwordFlow||found.passwordFlow),
+    source:(base.apiKey?base.source:null)||(found.apiKey?source||found.source:null)||base.source||found.source||'none'
+  };
 }
 
 function firebaseConfig(corpus){
   const text=normalize(corpus);
   const apiKey=firebaseApiKey(text);
   let authDomain=first(text,[
-    /\b(?:authDomain|FIREBASE_AUTH_DOMAIN|NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN|VITE_FIREBASE_AUTH_DOMAIN|REACT_APP_FIREBASE_AUTH_DOMAIN)\b\s*[:=]\s*["'`]([^"'`\s]+)["'`]/i,
+    /\b(?:authDomain|FIREBASE_AUTH_DOMAIN|NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN|VITE_FIREBASE_AUTH_DOMAIN|REACT_APP_FIREBASE_AUTH_DOMAIN|PUBLIC_FIREBASE_AUTH_DOMAIN)\b\s*[:=]\s*["'`]([^"'`\s]+)["'`]/i,
     /["']authDomain["']\s*:\s*["']([^"']+)["']/i,
     /https?:\/\/([a-z0-9-]+\.firebaseapp\.com)/i,
     /\b([a-z0-9-]+\.firebaseapp\.com)\b/i
   ]);
   let projectId=first(text,[
-    /\b(?:projectId|FIREBASE_PROJECT_ID|NEXT_PUBLIC_FIREBASE_PROJECT_ID|VITE_FIREBASE_PROJECT_ID|REACT_APP_FIREBASE_PROJECT_ID)\b\s*[:=]\s*["'`]([^"'`\s]+)["'`]/i,
+    /\b(?:projectId|FIREBASE_PROJECT_ID|NEXT_PUBLIC_FIREBASE_PROJECT_ID|VITE_FIREBASE_PROJECT_ID|REACT_APP_FIREBASE_PROJECT_ID|PUBLIC_FIREBASE_PROJECT_ID)\b\s*[:=]\s*["'`]([^"'`\s]+)["'`]/i,
     /["']projectId["']\s*:\s*["']([^"']+)["']/i,
     /https?:\/\/([a-z0-9-]+)\.firebaseio\.com/i,
-    /https?:\/\/([a-z0-9-]+)\.firebasedatabase\.app/i
+    /https?:\/\/([a-z0-9-]+)\.firebasedatabase\.app/i,
+    /https?:\/\/([a-z0-9-]+)\.firebaseapp\.com/i
   ]);
   if(!projectId&&authDomain?.endsWith('.firebaseapp.com'))projectId=authDomain.slice(0,-'.firebaseapp.com'.length);
   if(!authDomain&&projectId)authDomain=`${projectId}.firebaseapp.com`;
-  const passwordFlow=/signInWithEmailAndPassword|accounts:signInWithPassword|EMAIL_PASSWORD_SIGN_IN/i.test(text);
+  const passwordFlow=/signInWithEmailAndPassword|accounts:signInWithPassword|EMAIL_PASSWORD_SIGN_IN|signInWithPassword/i.test(text);
   return {apiKey,authDomain,projectId,passwordFlow,source:apiKey?'corpus':'none'};
 }
 
@@ -81,27 +109,30 @@ async function safeFetch(url,headers={}){
   let target;try{target=parseTarget(url);}catch{return null;}
   if(target.protocol!=='https:')return null;
   const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),TIMEOUT);
-  try{return await fetch(target.toString(),{redirect:'follow',signal:controller.signal,headers:{'user-agent':'LIMPO-Auth-Engine/1.2',...headers}});}catch{return null;}finally{clearTimeout(timer);}
+  try{return await fetch(target.toString(),{redirect:'follow',signal:controller.signal,headers:{'user-agent':'LIMPO-Auth-Engine/1.3',...headers}});}catch{return null;}finally{clearTimeout(timer);}
 }
 
-async function fetchPublicConfig(url){
+async function fetchPublicConfig(url,max=MAX_BYTES){
   const r=await safeFetch(url,{'accept':'application/json,text/javascript,text/plain,*/*;q=0.4'});
-  if(!r?.ok)return null;const text=await readLimited(r);return text||null;
+  if(!r?.ok)return null;const text=await readLimited(r,max);return text||null;
 }
 
-async function enrichFirebaseFromHost(initial){
+async function enrichFirebaseFromHost(initial,ctx){
   if(initial.apiKey)return initial;
   const hosts=[];
+  try{hosts.push(new URL(ctx?.finalUrl||ctx?.requestedUrl).hostname);}catch{}
   if(initial.authDomain)hosts.push(initial.authDomain);
   if(initial.projectId)hosts.push(`${initial.projectId}.firebaseapp.com`);
-  for(const host of [...new Set(hosts)].slice(0,2)){
+
+  let current={...initial};
+  for(const host of [...new Set(hosts)].slice(0,3)){
     for(const path of ['/__/firebase/init.json','/__/firebase/init.js']){
       const text=await fetchPublicConfig(`https://${host}${path}`);if(!text)continue;
-      const found=firebaseConfig(text);
-      if(found.apiKey)return {apiKey:found.apiKey,authDomain:found.authDomain||initial.authDomain,projectId:found.projectId||initial.projectId,passwordFlow:initial.passwordFlow||found.passwordFlow,source:'firebase-runtime-probe'};
+      current=mergeFirebase(current,firebaseConfig(text),'firebase-runtime-probe');
+      if(current.apiKey)return current;
     }
   }
-  return initial;
+  return current;
 }
 
 async function bundleTotal(url){
@@ -118,23 +149,77 @@ async function fetchBundleRange(url,start,end){
 
 async function enrichFirebaseFromBundles(initial,ctx){
   if(initial.apiKey)return initial;
-  const scripts=[...new Set(ctx?.resources?.scripts||[])].slice(0,8);let spent=0;
+  const scripts=[...new Set(ctx?.resources?.scripts||[])].slice(0,12);let spent=0;let current={...initial};
   for(const url of scripts){
     const total=await bundleTotal(url);if(!total)continue;
-    const starts=total<=BUNDLE_SLICE*3
+    const starts=total<=BUNDLE_SLICE*2
       ? [0]
-      : [0,Math.floor(total*.2),Math.floor(total*.4),Math.floor(total*.6),Math.max(0,total-BUNDLE_SLICE)];
+      : [0,Math.floor(total*.16),Math.floor(total*.33),Math.floor(total*.5),Math.floor(total*.67),Math.floor(total*.84),Math.max(0,total-BUNDLE_SLICE)];
     for(const rawStart of [...new Set(starts)]){
-      if(spent+BUNDLE_SLICE>BUNDLE_BUDGET)return initial;
+      if(spent+BUNDLE_SLICE>BUNDLE_BUDGET)return current;
       const start=Math.max(0,Math.min(rawStart,total-1));const end=Math.min(total-1,start+BUNDLE_SLICE-1);
       const text=await fetchBundleRange(url,start,end);spent+=BUNDLE_SLICE;if(!text)continue;
-      const found=firebaseConfig(text);
-      if(found.apiKey)return {apiKey:found.apiKey,authDomain:found.authDomain||initial.authDomain,projectId:found.projectId||initial.projectId,passwordFlow:initial.passwordFlow||found.passwordFlow,source:'targeted-bundle-scan'};
-      if(!initial.authDomain&&found.authDomain)initial.authDomain=found.authDomain;
-      if(!initial.projectId&&found.projectId)initial.projectId=found.projectId;
+      current=mergeFirebase(current,firebaseConfig(text),'targeted-bundle-scan');
+      if(current.apiKey)return current;
     }
   }
-  return initial;
+  return current;
+}
+
+function candidateMapUrls(ctx){
+  const out=new Set(ctx?.resources?.sourceMaps||[]);
+  for(const script of ctx?.resources?.scripts||[]){
+    try{
+      const u=new URL(script);
+      if(/\.m?js(?:$|\?)/i.test(u.pathname+u.search)){
+        const raw=script.replace(/(\.m?js)(\?.*)?$/i,'$1.map$2');
+        out.add(raw);
+      }
+    }catch{}
+  }
+  return [...out].slice(0,MAX_MAPS);
+}
+
+async function enrichFirebaseFromSourceMaps(initial,ctx){
+  if(initial.apiKey)return initial;
+  let current={...initial};
+  for(const url of candidateMapUrls(ctx)){
+    const text=await fetchPublicConfig(url,MAP_BYTES);if(!text)continue;
+    let searchable=text;
+    try{
+      const map=JSON.parse(text);
+      searchable=[...(map.sources||[]),...(map.sourcesContent||[])].join('\n');
+    }catch{}
+    current=mergeFirebase(current,firebaseConfig(searchable),'source-map');
+    if(current.apiKey)return current;
+  }
+  return current;
+}
+
+function configEndpointCandidates(ctx){
+  let origin='';try{origin=new URL(ctx?.finalUrl||ctx?.requestedUrl).origin;}catch{}
+  const out=[];
+  for(const raw of ctx?.endpoints||[]){
+    try{
+      const u=new URL(raw);
+      if(origin&&u.origin!==origin)continue;
+      if(!/(?:^|\/)(?:config|configuration|runtime|settings|environment|env|firebase)(?:[./?_-]|$)/i.test(u.pathname+u.search))continue;
+      if(/login|signin|token|password|session/i.test(u.pathname))continue;
+      out.push(u.toString());
+    }catch{}
+  }
+  return [...new Set(out)].slice(0,MAX_CONFIG_ENDPOINTS);
+}
+
+async function enrichFirebaseFromConfigEndpoints(initial,ctx){
+  if(initial.apiKey)return initial;
+  let current={...initial};
+  for(const url of configEndpointCandidates(ctx)){
+    const text=await fetchPublicConfig(url);if(!text)continue;
+    current=mergeFirebase(current,firebaseConfig(text),'public-config-endpoint');
+    if(current.apiKey)return current;
+  }
+  return current;
 }
 
 export function extractRuntimeConfig(providerId,ctx){
@@ -147,9 +232,11 @@ export function extractRuntimeConfig(providerId,ctx){
 export async function reconstructRuntimeConfig(providerId,ctx){
   const runtime=extractRuntimeConfig(providerId,ctx);
   if(providerId==='firebase'&&runtime.firebase){
-    runtime.firebase=await enrichFirebaseFromHost(runtime.firebase);
+    runtime.firebase=await enrichFirebaseFromHost(runtime.firebase,ctx);
+    runtime.firebase=await enrichFirebaseFromConfigEndpoints(runtime.firebase,ctx);
     runtime.firebase=await enrichFirebaseFromBundles(runtime.firebase,ctx);
-    runtime.firebase=await enrichFirebaseFromHost(runtime.firebase);
+    runtime.firebase=await enrichFirebaseFromSourceMaps(runtime.firebase,ctx);
+    runtime.firebase=await enrichFirebaseFromHost(runtime.firebase,ctx);
   }
   return runtime;
 }
