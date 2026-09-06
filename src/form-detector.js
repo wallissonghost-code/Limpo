@@ -1,0 +1,23 @@
+import { parseTarget } from './detector/scanner.js';
+
+const MAX_HTML=1_200_000;
+const TIMEOUT=7000;
+const REDIRECTS=5;
+
+function escAttr(v=''){return String(v).replace(/&quot;/gi,'"').replace(/&#39;/gi,"'").replace(/&amp;/gi,'&');}
+function attrs(tag){const out={};const re=/([a-zA-Z_:][-\w:.]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/g;let m;while((m=re.exec(tag)))out[m[1].toLowerCase()]=escAttr(m[2]??m[3]??m[4]??'');return out;}
+function scoreUser(a){let s=0;const v=[a.type,a.name,a.id,a.autocomplete,a.placeholder,a['aria-label']].filter(Boolean).join(' ').toLowerCase();if(a.type==='email')s+=10;if(/\bemail\b|e-mail/.test(v))s+=8;if(/username|user-name|login|usuario|usuário/.test(v))s+=6;if(a.autocomplete==='username'||a.autocomplete==='email')s+=7;if(a.type==='text')s+=1;return s;}
+function scorePass(a){let s=0;const v=[a.type,a.name,a.id,a.autocomplete,a.placeholder,a['aria-label']].filter(Boolean).join(' ').toLowerCase();if(a.type==='password')s+=12;if(/password|passwd|senha|pwd/.test(v))s+=8;if(/current-password|new-password/.test(a.autocomplete||''))s+=7;return s;}
+function selector(a,index){if(a.id)return `#${a.id}`;if(a.name)return `input[name="${a.name.replace(/"/g,'\\"')}"]`;if(a.type)return `input[type="${a.type}"]:nth-of-type(${index+1})`;return `input:nth-of-type(${index+1})`;}
+function summarize(a,index,score,kind){return {kind,score,selector:selector(a,index),type:a.type||'text',name:a.name||null,id:a.id||null,autocomplete:a.autocomplete||null,placeholder:a.placeholder||null};}
+
+async function timedFetch(url,options={}){const c=new AbortController();const t=setTimeout(()=>c.abort(),TIMEOUT);try{return await fetch(url,{...options,signal:c.signal});}finally{clearTimeout(t);}}
+async function fetchHtml(start){let current=start;for(let i=0;i<=REDIRECTS;i++){const r=await timedFetch(current.toString(),{redirect:'manual',headers:{'user-agent':'LIMPO-Form-Detector/1.0','accept':'text/html,application/xhtml+xml,*/*;q=0.5'}});if([301,302,303,307,308].includes(r.status)){const loc=r.headers.get('location');if(!loc)return{response:r,finalUrl:current};current=parseTarget(new URL(loc,current).toString());continue;}return{response:r,finalUrl:current};}throw new Error('Redirecionamentos demais.');}
+async function readLimited(r){const reader=r.body?.getReader();if(!reader)return{text:'',bytes:0,truncated:false};const chunks=[];let total=0,truncated=false;while(true){const {done,value}=await reader.read();if(done)break;const remain=MAX_HTML-total;if(remain<=0){truncated=true;break;}const part=value.byteLength>remain?value.slice(0,remain):value;chunks.push(part);total+=part.byteLength;if(value.byteLength>remain){truncated=true;break;}}try{await reader.cancel();}catch{}const all=new Uint8Array(total);let o=0;for(const c of chunks){all.set(c,o);o+=c.byteLength;}return{text:new TextDecoder().decode(all),bytes:total,truncated};}
+
+export async function detectLoginForm(rawUrl){const target=parseTarget(rawUrl);const {response,finalUrl}=await fetchHtml(target);const type=(response.headers.get('content-type')||'').toLowerCase();if(type&&!type.includes('text/html')&&!type.includes('xhtml'))throw new Error(`Conteúdo não é HTML: ${type}`);const data=await readLimited(response);const html=data.text;
+ const forms=[...html.matchAll(/<form\b[\s\S]*?<\/form\s*>/gi)].map(m=>m[0]);const inputs=[...html.matchAll(/<input\b[^>]*>/gi)].map((m,i)=>({tag:m[0],a:attrs(m[0]),index:i}));
+ let bestUser=null,bestPass=null;for(const x of inputs){const us=scoreUser(x.a),ps=scorePass(x.a);if(us>0&&(!bestUser||us>bestUser.score))bestUser=summarize(x.a,x.index,us,'username');if(ps>0&&(!bestPass||ps>bestPass.score))bestPass=summarize(x.a,x.index,ps,'password');}
+ const loginLikeForm=forms.find(f=>/<input\b[^>]*(?:type\s*=\s*["']?password|name\s*=\s*["'][^"']*(?:password|senha))/i.test(f))||null;
+ const formDetected=!!loginLikeForm||!!(bestUser&&bestPass);const status=formDetected?'FORM_DETECTED':(bestUser||bestPass?'FORM_PARTIAL':'FORM_NOT_FOUND');
+ return {ok:true,status,requestedUrl:target.toString(),finalUrl:finalUrl.toString(),httpStatus:response.status,htmlBytes:data.bytes,truncated:data.truncated,form:{detected:formDetected,formsFound:forms.length},username:{detected:!!bestUser,field:bestUser},password:{detected:!!bestPass,field:bestPass},note:status==='FORM_DETECTED'?'Formulário/campos de login identificados no HTML público.':status==='FORM_PARTIAL'?'Apenas parte dos campos foi identificada. O formulário pode ser dinâmico ou usar marcação diferente.':'Nenhum formulário de login foi identificado no HTML recebido. A página pode criar os campos via JavaScript.'};}
