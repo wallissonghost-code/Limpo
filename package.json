@@ -1,12 +1,13 @@
 {
   "name": "auth-detector",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vercel dev"
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
   },
   "devDependencies": {
-    "vercel": "^48.0.0"
+    "wrangler": "^4.35.0"
   }
 }
