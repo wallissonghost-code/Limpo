@@ -1,6 +1,7 @@
 import { analyzeUrl } from './src/auth-detector.js';
 import { detectLoginForm } from './src/form-detector.js';
 import { discoverAuth } from './src/auth-engine/discovery.js';
+import { adapterMatrixFor } from './src/auth-engine/registry.js';
 import { runAuthTest } from './src/auth-engine/orchestrator.js';
 
 function json(data,status=200){
@@ -25,7 +26,11 @@ async function analyze(request){
 
 async function discover(request){
   if(request.method!=='POST')return json({error:'Use POST.'},405);
-  try{const body=await readBody(request);if(!body.url)throw new Error('Informe uma URL.');return json(await discoverAuth(String(body.url).trim()));}
+  try{
+    const body=await readBody(request);if(!body.url)throw new Error('Informe uma URL.');
+    const discovery=await discoverAuth(String(body.url).trim());
+    return json({...discovery,adapters:adapterMatrixFor(discovery)});
+  }
   catch(error){const message=error?.name==='AbortError'?'A descoberta excedeu o tempo limite.':(error?.message||'Falha ao descobrir o mecanismo de autenticação.');return json({error:message},400);}
 }
 
