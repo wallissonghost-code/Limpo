@@ -2,7 +2,7 @@ const plugin=(id,name,signatures)=>({
   id,name,
   detect(ctx){
     const evidence=[];
-    const corpus=ctx.corpus.join('\n');
+    const corpus=ctx._providerCorpus ?? (ctx._providerCorpus=ctx.corpus.join('\n'));
     for(const s of signatures){
       const m=corpus.match(s.regex);
       if(m)evidence.push({provider:id,type:s.type||'provider_signal',label:s.label,value:m[0].slice(0,220),source:'corpus',strength:s.strength,weight:s.weight});
