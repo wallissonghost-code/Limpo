@@ -21,11 +21,11 @@ export default {
     const cfg=discovery.runtime?.firebase||{};
     if(!cfg.apiKey)return{status:'CONFIG_REQUIRED',success:null,reason:'Falta a configuração pública mínima do Firebase. Nenhuma credencial foi enviada.'};
     const url=`${ENDPOINT}?key=${encodeURIComponent(cfg.apiKey)}`;
-    const response=await timedFetch(url,{method:'POST',headers:{'content-type':'application/json','accept':'application/json','user-agent':'LIMPO-Auth-Engine/1.0'},body:JSON.stringify({email:String(credentials.username||''),password:String(credentials.password||''),returnSecureToken:true})});
+    const response=await timedFetch(url,{method:'POST',headers:{'content-type':'application/json','accept':'application/json','user-agent':'LIMPO-Auth-Engine/2.1'},body:JSON.stringify({email:String(credentials.username||''),password:String(credentials.password||''),returnSecureToken:true})});
     let payload={};try{payload=await response.json();}catch{}
-    if(response.ok&&payload?.idToken){return{status:'LOGIN_SUCCESS',success:true,httpStatus:response.status,transport:'firebase-password',sessionCookieSet:false,reason:'O Firebase Authentication aceitou a credencial. Valores de token não são retornados pelo LIMPO.'};}
+    if(response.ok&&payload?.idToken){return{status:'LOGIN_SUCCESS',success:true,httpStatus:response.status,transport:'firebase-password',sessionCookieSet:false,tokenReturned:true,userReturned:Boolean(payload?.localId||payload?.email),providerAcceptedCredential:true,reason:'O Firebase Authentication aceitou a credencial. Valores de token não são retornados pelo LIMPO.'};}
     const code=firebaseErrorMessage(payload);
-    if(/INVALID_LOGIN_CREDENTIALS|INVALID_PASSWORD|EMAIL_NOT_FOUND|USER_DISABLED/.test(code))return{status:'LOGIN_FAILED',success:false,httpStatus:response.status,transport:'firebase-password',sessionCookieSet:false,reason:'O Firebase Authentication rejeitou a credencial.'};
+    if(/INVALID_LOGIN_CREDENTIALS|INVALID_PASSWORD|EMAIL_NOT_FOUND|USER_DISABLED/.test(code))return{status:'LOGIN_FAILED',success:false,httpStatus:response.status,transport:'firebase-password',sessionCookieSet:false,providerRejectedCredential:true,explicitFailure:true,reason:'O Firebase Authentication rejeitou a credencial.'};
     if(/OPERATION_NOT_ALLOWED|PASSWORD_LOGIN_DISABLED/.test(code))return{status:'ADAPTER_NOT_READY',success:null,httpStatus:response.status,transport:'firebase-password',sessionCookieSet:false,reason:'O projeto Firebase foi identificado, mas o login por senha não está habilitado para este fluxo.'};
     return{status:'LOGIN_INCONCLUSIVE',success:null,httpStatus:response.status,transport:'firebase-password',sessionCookieSet:false,reason:`O Firebase respondeu HTTP ${response.status}, mas o resultado não foi conclusivo para autenticação.`};
   }
