@@ -37,7 +37,7 @@ const FRAMEWORK_PATTERNS = {
   rails: [/_rails_session/i,/csrf-param/i],
   spring: [/JSESSIONID/i,/spring-security/i],
   aspnet: [/ASP\.NET_SessionId/i,/\.AspNetCore\./i],
-  express: [/connect\.sid/i,/express/i],
+  express: [/connect\.sid/i,/x-powered-by[^\n]{0,40}express/i],
   fastapi: [/fastapi/i,/\/docs(?:\b|\/)/i],
   nestjs: [/nestjs/i,/@nestjs\//i]
 };
@@ -92,8 +92,8 @@ export function inspectBehavior(ctx, text, source, baseUrl) {
   if (/\baccess_token\b/i.test(text)) addSignal(ctx,{type:'access_token',source,weight:WEIGHTS.storageToken,strength:'medium'});
   if (/\brefresh_token\b/i.test(text)) { ctx.flow.refresh=true; addSignal(ctx,{type:'refresh_token',source,weight:WEIGHTS.refreshToken,strength:'medium'}); }
   if (/\bid_token\b/i.test(text)) addSignal(ctx,{type:'id_token',source,weight:WEIGHTS.storageToken,strength:'medium'});
-  if (/credentials\s*:\s*["'`]include["'`]/i.test(text)|/withCredentials\s*=\s*true/i.test(text)) { ctx.authentication.session='cookie'; addSignal(ctx,{type:'credentialed_requests',source,weight:WEIGHTS.sessionCookie,strength:'medium'}); }
-  if (/localStorage[\s\S]{0,120}(token|auth|session)/i.test(text)) { ctx.authentication.session=ctx.authentication.session||'browser-storage'; addSignal(ctx,{type:'auth_storage',source,weight:WEIGHTS.storageToken,strength:'medium'}); }
+  if (/credentials\s*:\s*["'`]include["'`]/i.test(text) || /withCredentials\s*=\s*true/i.test(text)) { ctx.authentication.session='cookie'; addSignal(ctx,{type:'credentialed_requests',source,weight:WEIGHTS.sessionCookie,strength:'medium'}); }
+  if (/localStorage[\s\S]{0,120}(token|auth|session)/i.test(text)) { if(ctx.authentication.session==='unknown')ctx.authentication.session='browser-storage'; addSignal(ctx,{type:'auth_storage',source,weight:WEIGHTS.storageToken,strength:'medium'}); }
   if (/<form\b[\s\S]{0,1200}type=["']password["']/i.test(text)) { ctx.authentication.type='password'; ctx.flow.login=true; addSignal(ctx,{type:'login_form',source,weight:WEIGHTS.loginForm,strength:'weak'}); }
 
   for (const [name, patterns] of Object.entries(FRAMEWORK_PATTERNS)) {
@@ -115,7 +115,7 @@ export function inspectBehavior(ctx, text, source, baseUrl) {
 
   if (/\.well-known\/openid-configuration|openid-connect|\boidc\b/i.test(text)) { ctx.authentication.protocol='oidc'; addSignal(ctx,{type:'oidc',source,weight:WEIGHTS.oidcMetadata,strength:'strong'}); }
   else if (/oauth2?|authorization_code|code_challenge|pkce/i.test(text)) { ctx.authentication.protocol='oauth2'; addSignal(ctx,{type:'oauth2',source,weight:4,strength:'medium'}); }
-  if (/eyJ[a-zA-Z0-9_-]{5,}\.[a-zA-Z0-9_-]{5,}\.[a-zA-Z0-9_-]{5,}|jwt|jsonwebtoken/i.test(text)) { ctx.authentication.token='jwt'; addSignal(ctx,{type:'jwt',source,weight:3,strength:'medium'}); }
+  if (/eyJ[a-zA-Z0-9_-]{5,}\.[a-zA-Z0-9_-]{5,}\.[a-zA-Z0-9_-]{5,}|\bjwt\b|jsonwebtoken/i.test(text)) { ctx.authentication.token='jwt'; addSignal(ctx,{type:'jwt',source,weight:3,strength:'medium'}); }
 }
 
 export function inspectHeaders(ctx, headers, source='headers') {
@@ -130,4 +130,6 @@ export function inspectHeaders(ctx, headers, source='headers') {
   }
   const www = headers.get?.('www-authenticate') || '';
   if (/bearer/i.test(www)) { ctx.authentication.token='bearer'; addSignal(ctx,{type:'www_authenticate_bearer',source,weight:4,strength:'medium'}); }
+  const powered=headers.get?.('x-powered-by')||'';
+  if(powered)inspectBehavior(ctx,`x-powered-by: ${powered}`,source,'https://invalid.local/');
 }
