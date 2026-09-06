@@ -1,6 +1,6 @@
 export default {
   id:'cognito-password',name:'Amazon Cognito Password',provider:'cognito',methods:['password'],priority:100,
-  canHandle(d,m){return d.provider?.id==='cognito'&&m==='password';},
-  availability(d,m){return this.canHandle(d,m)?{supported:true,ready:false,mode:'config-required',reason:'Cognito detectado. User Pool, client e fluxo permitido ainda precisam ser reconstruídos.'}:{supported:false,ready:false,mode:'none'};},
-  async test(){return{status:'NOT_READY',success:null,reason:'Adapter Cognito identificado, mas o fluxo ainda não está reconstruído.'};}
+  canHandle(d,m){return d.provider?.id==='cognito'&&m==='password'&&d.capabilities?.password===true;},
+  availability(d,m){return this.canHandle(d,m)?{supported:true,ready:false,mode:'config-required',reason:'Provedor identificado: Amazon Cognito. O método Password foi detectado, mas User Pool, client e fluxo permitido ainda não foram reconstruídos com segurança. Nenhuma credencial foi enviada.'}:{supported:false,ready:false,mode:'none'};},
+  async test(){return{status:'CONFIG_REQUIRED',success:null,reason:'O adaptador Cognito Password foi selecionado, mas ainda faltam parâmetros públicos do fluxo.'};}
 };
