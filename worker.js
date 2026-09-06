@@ -1,8 +1,10 @@
 import { analyzeUrl } from './src/auth-detector.js';
 import { detectLoginForm } from './src/form-detector.js';
+import { testLogin } from './src/login-tester.js';
 import { discoverAuth,publicDiscovery } from './src/auth-engine/discovery.js';
 import { adapterMatrixFor } from './src/auth-engine/registry.js';
 import { runAuthTest } from './src/auth-engine/orchestrator.js';
+import { verifyLoginResult } from './src/auth-engine/post-login-verifier.js';
 
 function json(data,status=200){
   return new Response(JSON.stringify(data),{
@@ -40,6 +42,33 @@ async function analyzeForm(request){
   catch(error){const message=error?.name==='AbortError'?'A análise excedeu o tempo limite.':(error?.message||'Falha ao analisar o formulário.');return json({error:message},400);}
 }
 
+async function directPasswordLogin(url,credentials){
+  // This is the exact proven transport path that powered /api/login-test before
+  // commit 76ebad3. Discovery/orchestration must never prevent a password
+  // attempt that this bounded single-attempt tester can reconstruct safely.
+  const result=await testLogin(url,credentials.username,credentials.password);
+  const verification=verifyLoginResult(result);
+  return {
+    ok:true,
+    method:'password',
+    pipeline:'direct-password',
+    adapter:{id:'direct-password',name:'Direct Password Login',provider:result?.provider||'generic',mode:'automated',ready:true},
+    result,
+    verification,
+    status:verification.status,
+    success:verification.success,
+    confidence:verification.confidence,
+    evidence:verification.evidence,
+    reason:verification.reason,
+    httpStatus:result?.httpStatus,
+    loginPage:result?.loginPage,
+    submitUrl:result?.submitUrl,
+    redirectTo:result?.redirectTo,
+    sessionCookieSet:Boolean(result?.sessionCookieSet),
+    note:result?.note||''
+  };
+}
+
 async function loginTest(request){
   if(request.method!=='POST')return json({error:'Use POST.'},405);
   try{
@@ -49,9 +78,18 @@ async function loginTest(request){
     const method=String(body.method||'password');
     const credentials={username:String(body.email||body.username||''),password:String(body.password||'')};
     if(method==='password'&&(!credentials.username||!credentials.password))throw new Error('Informe e-mail/usuário e senha.');
-    return json(await runAuthTest({url:String(body.url).trim(),method,credentials}));
+    const url=String(body.url).trim();
+
+    // Password keeps the working legacy transport as the primary path. The
+    // Auth Engine remains responsible for discovery and non-password flows.
+    // This avoids a discovery/configuration failure blocking the actual login.
+    if(method==='password')return json(await directPasswordLogin(url,credentials));
+    return json(await runAuthTest({url,method,credentials}));
   }
-  catch(error){const message=error?.name==='AbortError'?'O teste excedeu o tempo limite.':(error?.message||'Falha ao testar o login.');return json({error:message},400);}
+  catch(error){
+    const message=error?.name==='AbortError'?'O teste excedeu o tempo limite.':(error?.message||String(error||'Falha ao testar o login.'));
+    return json({error:message,stage:'login-execution'},400);
+  }
 }
 
 export default {
@@ -67,8 +105,8 @@ export default {
       return new Response('LIMPO Auth Engine',{status:200});
     }catch(error){
       if(url.pathname.startsWith('/api/')){
-        const message=error?.name==='AbortError'?'A operação excedeu o tempo limite.':(error?.message||'Falha interna na API do LIMPO.');
-        return json({error:message},500);
+        const message=error?.name==='AbortError'?'A operação excedeu o tempo limite.':(error?.message||String(error||'Falha interna na API do LIMPO.'));
+        return json({error:message,stage:'worker'},500);
       }
       throw error;
     }
