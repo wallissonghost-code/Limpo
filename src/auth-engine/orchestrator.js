@@ -1,5 +1,6 @@
 import { discoverAuth,publicDiscovery } from './discovery.js';
 import { findAdapter,adapterMatrixFor } from './registry.js';
+import { verifyLoginResult } from './post-login-verifier.js';
 
 export async function runAuthTest({url,method='password',credentials={}}){
   const discovery=await discoverAuth(url);
@@ -35,9 +36,17 @@ export async function runAuthTest({url,method='password',credentials={}}){
   }
 
   const result=await adapter.test({url,method,credentials,discovery});
+  const verification=verifyLoginResult(result);
   return {
     ok:true,method,
     adapter:{id:adapter.id,name:adapter.name,provider:adapter.provider||'generic',...availability},
-    discovery:safeDiscovery,adapters:adapterMatrix,result,...result
+    discovery:safeDiscovery,adapters:adapterMatrix,
+    result,
+    verification,
+    status:verification.status,
+    success:verification.success,
+    confidence:verification.confidence,
+    evidence:verification.evidence,
+    reason:verification.reason
   };
 }
